@@ -7,6 +7,8 @@ use crate::breakpoint::Breakpoint;
 use crate::mach;
 use crate::ptrace::{self, Pid};
 use crate::register::ThreadState64;
+#[cfg(target_arch = "x86_64")]
+use crate::register::FloatState64;
 
 #[derive(Debug, Clone, Copy)]
 pub enum WaitStatus {
@@ -245,6 +247,18 @@ impl Debugger {
     /// 汎用レジスタを取得します。
     pub fn registers(&self) -> io::Result<ThreadState64> {
         mach::get_registers(self.pid)
+    }
+
+    /// 浮動小数点レジスタを取得します (x86_64 のみ)。
+    #[cfg(target_arch = "x86_64")]
+    pub fn float_registers(&self) -> io::Result<FloatState64> {
+        mach::get_float_registers(self.pid)
+    }
+
+    /// 浮動小数点レジスタを設定します (x86_64 のみ)。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_float_registers(&self, state: &FloatState64) -> io::Result<()> {
+        mach::set_float_registers(self.pid, state)
     }
 
     /// 汎用レジスタを設定します。

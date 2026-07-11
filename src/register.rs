@@ -197,5 +197,143 @@ impl ThreadState64 {
     }
 }
 
+/// x86_64 FPU 浮動小数点状態 (x86_FLOAT_STATE64)。
+/// ST0-ST7 (x87 80ビット) / MM0-MM7 (MMX 64ビット) / MXCSR を保持します。
+/// ST と MM は同じ物理レジスタのエイリアスです。
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct FloatState64 {
+    pub __fpu_reserved:   [i32; 2],
+    pub __fpu_fcw:        u16,   // x87 FPU 制御ワード
+    pub __fpu_fsw:        u16,   // x87 FPU ステータスワード
+    pub __fpu_ftw:        u8,    // x87 FPU タグワード (abridged)
+    pub __fpu_rsrv1:      u8,
+    pub __fpu_fop:        u16,
+    pub __fpu_ip:         u32,
+    pub __fpu_cs:         u16,
+    pub __fpu_rsrv2:      u16,
+    pub __fpu_dp:         u32,
+    pub __fpu_ds:         u16,
+    pub __fpu_rsrv3:      u16,
+    pub __fpu_mxcsr:      u32,
+    pub __fpu_mxcsrmask:  u32,
+    /// ST0-ST7 / MM0-MM7: 各 10 バイト値 + 6 バイトパディング = 16 バイト
+    pub __fpu_stmm:       [[u8; 16]; 8],
+    /// XMM0-XMM15: 各 16 バイト
+    pub __fpu_xmm:        [[u8; 16]; 16],
+    pub __fpu_rsrv4:      [u8; 96],
+    pub __fpu_reserved1:  i32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Default for FloatState64 {
+    fn default() -> Self {
+        // Safety: 全フィールドが数値型 or バイト配列なのでゼロ初期化で有効
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FloatState64 {
+    /// x87 80ビット拡張精度レジスタを f64 に変換します。
+    /// 精度は落ちますが符号・指数・大まかな値は正確に保ちます。
+    fn st_to_f64(reg: &[u8; 16]) -> f64 {
+        let mant = u64::from_le_bytes(reg[0..8].try_into().unwrap());
+        let exp_sign = u16::from_le_bytes([reg[8], reg[9]]);
+        let sign = (exp_sign >> 15) as u64;
+        let exp80 = (exp_sign & 0x7fff) as i32;
+
+        // 特殊値処理
+        if exp80 == 0x7fff {
+            if mant & 0x7fff_ffff_ffff_ffff == 0 {
+                let bits = (sign << 63) | 0x7ff0_0000_0000_0000;
+                return f64::from_bits(bits); // ±Inf
+            }
+            return f64::NAN;
+        }
+        if exp80 == 0 && mant == 0 {
+            return if sign != 0 { -0.0 } else { 0.0 };
+        }
+
+        // 通常値: 80ビットバイアス 16383 → 64ビットバイアス 1023
+        // 80ビットは整数ビット明示。64ビットは暗黙。
+        let exp64 = exp80 - 16383 + 1023;
+        if exp64 >= 0x7ff {
+            let bits = (sign << 63) | 0x7ff0_0000_0000_0000;
+            return f64::from_bits(bits);
+        }
+        if exp64 <= 0 {
+            return if sign != 0 { -0.0 } else { 0.0 };
+        }
+        // 64ビット仮数: 80ビット仮数の下位 63 ビットから上位 52 ビットを取る
+        let frac = (mant >> 11) & 0x000f_ffff_ffff_ffff;
+        f64::from_bits((sign << 63) | ((exp64 as u64) << 52) | frac)
+    }
+
+    /// レジスタ名に値を設定します。
+    /// ST/MM: 下位 64 ビット (MMX 整数値) に書き込みます。
+    /// XMM:   下位 64 ビットに書き込み、上位 64 ビットはゼロにします。
+    pub fn set(&mut self, name: &str, value: u64) -> Option<()> {
+        let name = name.to_lowercase();
+        let bytes = value.to_le_bytes();
+        // st0-st7 / mm0-mm7
+        let st_idx: Option<usize> = if let Some(rest) = name.strip_prefix("st") {
+            rest.parse().ok()
+        } else if let Some(rest) = name.strip_prefix("mm") {
+            rest.parse().ok()
+        } else {
+            None
+        };
+        if let Some(n) = st_idx {
+            if n >= 8 { return None; }
+            self.__fpu_stmm[n][..8].copy_from_slice(&bytes);
+            self.__fpu_stmm[n][8..].fill(0);
+            return Some(());
+        }
+        // xmm0-xmm15
+        if let Some(rest) = name.strip_prefix("xmm") {
+            let n: usize = rest.parse().ok()?;
+            if n >= 16 { return None; }
+            self.__fpu_xmm[n][..8].copy_from_slice(&bytes);
+            self.__fpu_xmm[n][8..].fill(0);
+            return Some(());
+        }
+        match name.as_str() {
+            "mxcsr" => self.__fpu_mxcsr = value as u32,
+            "fcw"   => self.__fpu_fcw   = value as u16,
+            "fsw"   => self.__fpu_fsw   = value as u16,
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// MMX / ST / XMM レジスタを表示します。
+    pub fn display(&self) {
+        println!(
+            "  FCW: {:#06x}  FSW: {:#06x}  FTW: {:#04x}  MXCSR: {:#010x}",
+            self.__fpu_fcw, self.__fpu_fsw, self.__fpu_ftw, self.__fpu_mxcsr
+        );
+        for i in 0..8 {
+            let reg = &self.__fpu_stmm[i];
+            let mant = u64::from_le_bytes(reg[0..8].try_into().unwrap());
+            let exp_sign = u16::from_le_bytes([reg[8], reg[9]]);
+            let fval = Self::st_to_f64(reg);
+            println!(
+                "  ST{i}/MM{i}: {exp_sign:04x} {mant:016x}  ({fval:e})"
+            );
+        }
+        for i in 0..16 {
+            let reg = &self.__fpu_xmm[i];
+            let lo = u64::from_le_bytes(reg[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(reg[8..16].try_into().unwrap());
+            print!(" XMM{i:02}: {hi:016x}_{lo:016x}");
+            if (i + 1) % 2 == 0 {
+                println!();
+            }
+        }
+    }
+}
+
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("unsupported architecture: this debugger base is only for x86_64 or aarch64 macOS");

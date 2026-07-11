@@ -2,12 +2,18 @@ use std::os::raw::c_int;
 
 use crate::ptrace::Pid;
 use crate::register::ThreadState64;
+#[cfg(target_arch = "x86_64")]
+use crate::register::FloatState64;
 
 pub type MachPort = u32;
 pub type KernReturn = c_int;
 
 #[cfg(target_arch = "x86_64")]
 const THREAD_STATE64_FLAVOR: i32 = 4; // x86_THREAD_STATE64
+#[cfg(target_arch = "x86_64")]
+const FLOAT_STATE64_FLAVOR: i32 = 5; // x86_FLOAT_STATE64
+#[cfg(target_arch = "x86_64")]
+const FLOAT_STATE64_COUNT: u32 = 131; // x86_FLOAT_STATE64_COUNT (524 bytes / 4)
 
 #[cfg(target_arch = "aarch64")]
 const THREAD_STATE64_FLAVOR: i32 = 6; // ARM_THREAD_STATE64
@@ -152,6 +158,47 @@ pub fn get_registers(pid: Pid) -> std::io::Result<ThreadState64> {
         let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_get_state")?;
         Ok(state)
+    }
+}
+
+/// 浮動小数点レジスタ状態を取得します (x86_64 のみ)。
+#[cfg(target_arch = "x86_64")]
+pub fn get_float_registers(pid: Pid) -> std::io::Result<FloatState64> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let mut state = FloatState64::default();
+        let mut count = FLOAT_STATE64_COUNT;
+        let ret = thread_get_state(
+            thread,
+            FLOAT_STATE64_FLAVOR,
+            &mut state as *mut FloatState64 as *mut u32,
+            &mut count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        mach_err(ret, "thread_get_state (float)")?;
+        Ok(state)
+    }
+}
+
+/// 浮動小数点レジスタ状態を設定します (x86_64 のみ)。
+#[cfg(target_arch = "x86_64")]
+pub fn set_float_registers(pid: Pid, state: &FloatState64) -> std::io::Result<()> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let count = FLOAT_STATE64_COUNT;
+        let ret = thread_set_state(
+            thread,
+            FLOAT_STATE64_FLAVOR,
+            state as *const FloatState64 as *const u32,
+            count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        mach_err(ret, "thread_set_state (float)")?;
+        Ok(())
     }
 }
 

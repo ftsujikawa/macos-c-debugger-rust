@@ -2,9 +2,11 @@ mod breakpoint;
 mod debugger;
 mod disasm;
 mod expr;
+mod leak_tracker;
 mod mach;
 mod ptrace;
 mod register;
+mod stub_finder;
 mod symbols;
 
 use std::env;
@@ -13,6 +15,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use debugger::{Debugger, WaitStatus};
+use leak_tracker::{LeakTracker, auto_cont};
 use symbols::{FrameBaseDef, Symbols, Variable, VarLocation};
 
 /// SIGINTを転送する先の子プロセスPID (0 = 未設定)
@@ -653,7 +656,7 @@ fn show_command(
             let vars = syms.global_variables();
             print_vars(dbg, &vars, slide);
         }
-        _ => eprintln!("show: unknown subcommand '{}' (bp|locals|args|globals)", sub),
+        _ => eprintln!("show: unknown subcommand '{}' (bp|locals|args|globals|leaks)", sub),
     }
 }
 
@@ -717,6 +720,7 @@ fn main() -> io::Result<()> {
 
     let stdin = io::stdin();
     let mut line = String::new();
+    let mut leak_tracker: Option<LeakTracker> = None;
 
     loop {
         // 起動直後は task_for_pid が未準備で失敗することがあるため、
@@ -766,6 +770,8 @@ fn main() -> io::Result<()> {
                 println!("  show locals                  list local variables at current PC");
                 println!("  show args                    list function arguments at current PC");
                 println!("  show globals                 list global variables");
+                println!("  leaks on|off                 enable/disable heap leak tracking");
+                println!("  leaks show / show leaks      show live (possibly leaked) allocations");
                 println!("  base                         show main executable load address");
                 println!("  q, quit, exit                quit");
             }
@@ -829,7 +835,8 @@ fn main() -> io::Result<()> {
             }
             "c" | "continue" | "cont" => {
                 CHILD_RUNNING.store(true, Ordering::SeqCst);
-                let status = dbg.cont()?;
+                let raw = dbg.cont()?;
+                let status = auto_cont(&mut dbg, &mut leak_tracker, raw)?;
                 CHILD_RUNNING.store(false, Ordering::SeqCst);
                 print_status(status);
                 if matches!(status, WaitStatus::Exited { .. }) {
@@ -917,6 +924,11 @@ fn main() -> io::Result<()> {
                 match dbg.registers() {
                     Ok(regs) => regs.display(),
                     Err(e) => eprintln!("failed to read registers: {}", e),
+                }
+                #[cfg(target_arch = "x86_64")]
+                match dbg.float_registers() {
+                    Ok(fregs) => fregs.display(),
+                    Err(e) => eprintln!("failed to read float registers: {}", e),
                 }
             }
             cmd if cmd == "p" || cmd == "print"
@@ -1028,11 +1040,19 @@ fn main() -> io::Result<()> {
                     }
                 };
 
-                if target.starts_with('$')
-                    && target.len() > 1
-                    && target.chars().skip(1).all(|c| c.is_alphanumeric() || c == '_')
+                // $rax 形式または rax 形式でレジスタ名を試みる
+                let reg_name = if target.starts_with('$') && target.len() > 1
+                    && target[1..].chars().all(|c| c.is_alphanumeric() || c == '_')
                 {
-                    let reg = &target[1..];
+                    Some(&target[1..])
+                } else if is_identifier(target) {
+                    Some(target)
+                } else {
+                    None
+                };
+
+                let mut tried_as_reg = false;
+                if let Some(reg) = reg_name {
                     let mut regs = match dbg.registers() {
                         Ok(r) => r,
                         Err(e) => {
@@ -1040,17 +1060,41 @@ fn main() -> io::Result<()> {
                             continue;
                         }
                     };
-                    if regs.set(reg, value).is_none() {
-                        eprintln!("unknown register: {}", target);
-                        continue;
+                    if regs.set(reg, value).is_some() {
+                        tried_as_reg = true;
+                        if let Err(e) = dbg.set_registers(&regs) {
+                            eprintln!("failed to set registers: {}", e);
+                            continue;
+                        }
+                        println!("set ${} = {:#018x}", reg, value);
                     }
-                    if let Err(e) = dbg.set_registers(&regs) {
-                        eprintln!("failed to set registers: {}", e);
-                        continue;
+                }
+
+                // 汎用レジスタで見つからなければ浮動小数点レジスタを試みる (x86_64)
+                #[cfg(target_arch = "x86_64")]
+                if !tried_as_reg {
+                    if let Some(reg) = reg_name {
+                        match dbg.float_registers() {
+                            Ok(mut fregs) => {
+                                if fregs.set(reg, value).is_some() {
+                                    tried_as_reg = true;
+                                    if let Err(e) = dbg.set_float_registers(&fregs) {
+                                        eprintln!("failed to set float registers: {}", e);
+                                        continue;
+                                    }
+                                    println!("set ${} = {:#018x}", reg, value);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("failed to read float registers: {}", e);
+                                continue;
+                            }
+                        }
                     }
-                    println!("set {} = {:#018x}", target, value);
-                } else {
-                    // 変数名なら値ではなくアドレスとサイズを取得する
+                }
+
+                if !tried_as_reg {
+                    // 変数名または数値アドレス式として扱う
                     let (addr, byte_size) = if is_identifier(target) {
                         match resolve_variable(&dbg, base, syms.as_ref(), target) {
                             Ok((a, sz)) => (a, sz as usize),
@@ -1099,7 +1143,67 @@ fn main() -> io::Result<()> {
                 show_disasm(&parts, &dbg, base, syms.as_ref());
             }
             "show" => {
-                show_command(&parts, &dbg, base, syms.as_ref());
+                if parts.get(1) == Some(&"leaks") {
+                    match leak_tracker.as_ref() {
+                        Some(tr) => tr.show_leaks(syms.as_ref(), base),
+                        None => eprintln!("leak tracking not enabled (use 'leaks on' to start)"),
+                    }
+                } else {
+                    show_command(&parts, &dbg, base, syms.as_ref());
+                }
+            }
+            "leaks" => {
+                let sub = parts.get(1).copied().unwrap_or("");
+                match sub {
+                    "on" | "start" | "enable" => {
+                        let Some(ref syms) = syms else {
+                            eprintln!("leaks: no symbol info loaded");
+                            continue;
+                        };
+                        let Some(base_addr) = base else {
+                            eprintln!("leaks: image base unknown");
+                            continue;
+                        };
+                        let malloc  = syms.stub_address("malloc",  base_addr).map(|a| a as usize);
+                        let calloc  = syms.stub_address("calloc",  base_addr).map(|a| a as usize);
+                        let realloc = syms.stub_address("realloc", base_addr).map(|a| a as usize);
+                        let free    = syms.stub_address("free",    base_addr).map(|a| a as usize);
+                        if [malloc, calloc, realloc, free].iter().all(|a| a.is_none()) {
+                            eprintln!("leaks: no malloc/free stubs found in binary");
+                            continue;
+                        }
+                        let mut tr = LeakTracker::new();
+                        match tr.enable(&mut dbg, malloc, calloc, realloc, free) {
+                            Ok(()) => {
+                                println!("Leak tracking enabled.");
+                                if let Some(a) = malloc  { println!("  malloc  @ {:#018x}", a); }
+                                if let Some(a) = calloc  { println!("  calloc  @ {:#018x}", a); }
+                                if let Some(a) = realloc { println!("  realloc @ {:#018x}", a); }
+                                if let Some(a) = free    { println!("  free    @ {:#018x}", a); }
+                                leak_tracker = Some(tr);
+                            }
+                            Err(e) => eprintln!("leaks: {}", e),
+                        }
+                    }
+                    "off" | "stop" | "disable" => {
+                        if let Some(mut tr) = leak_tracker.take() {
+                            if let Err(e) = tr.disable(&mut dbg) {
+                                eprintln!("leaks: {}", e);
+                            } else {
+                                println!("Leak tracking disabled.");
+                            }
+                        } else {
+                            eprintln!("leak tracking is not enabled");
+                        }
+                    }
+                    "show" | "status" | "" => {
+                        match leak_tracker.as_ref() {
+                            Some(tr) => tr.show_leaks(syms.as_ref(), base),
+                            None => eprintln!("leak tracking not enabled (use 'leaks on' to start)"),
+                        }
+                    }
+                    _ => eprintln!("usage: leaks on|off|show"),
+                }
             }
             "base" => {
                 match dbg.image_base() {

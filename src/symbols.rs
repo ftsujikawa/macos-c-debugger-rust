@@ -4,6 +4,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use object::{Object, ObjectSegment, ObjectSymbol};
 
 /// 実行ファイルのシンボル情報と DWARF 行番号情報を保持します。
@@ -23,6 +25,8 @@ pub struct Symbols {
     type_names: BTreeSet<String>,
     /// 読み込んだ変数情報（ローカル変数・引数・グローバル）
     variables: Vec<Variable>,
+    /// 外部関数スタブの静的アドレス (シンボル名 → static vaddr)
+    stubs: HashMap<String, u64>,
 }
 
 /// DW_AT_frame_base の種類。DW_OP_fbreg のオフセット基準を決定します。
@@ -90,6 +94,12 @@ impl Symbols {
         let (line_rows, comp_dirs, type_names, variables) =
             load_line_rows(&debug_file).unwrap_or_default();
 
+        // malloc/free などの外部スタブアドレスを Mach-O から取得
+        let stubs = crate::stub_finder::find_stubs(
+            &data,
+            &["malloc", "calloc", "realloc", "free"],
+        );
+
         Ok(Self {
             symbols,
             text_vmaddr,
@@ -98,6 +108,7 @@ impl Symbols {
             comp_dirs,
             type_names,
             variables,
+            stubs,
         })
     }
 
@@ -177,6 +188,13 @@ impl Symbols {
     /// 実行時のロードアドレスからスライド量を計算します。
     pub fn slide(&self, runtime_base: u64) -> u64 {
         runtime_base.wrapping_sub(self.text_vmaddr)
+    }
+
+    /// 外部関数スタブの実行時アドレスを返します。
+    /// `runtime_base` は ASLR 適用後の __TEXT セグメントベースアドレスです。
+    pub fn stub_address(&self, name: &str, runtime_base: u64) -> Option<u64> {
+        let static_addr = *self.stubs.get(name)?;
+        Some(static_addr.wrapping_add(self.slide(runtime_base)))
     }
 
     /// シンボル名からファイル上の仮想アドレスを検索します。

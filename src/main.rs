@@ -10,9 +10,36 @@ mod symbols;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use debugger::{Debugger, WaitStatus};
 use symbols::{Symbols, VarLocation};
+
+/// SIGINTを転送する先の子プロセスPID (0 = 未設定)
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// 子プロセスが実行中のとき true
+static CHILD_RUNNING: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn sigint_handler(_: libc::c_int) {
+    // 実行中のときだけ転送し、フラグを下ろす（多重転送を防ぐ）
+    if CHILD_RUNNING.swap(false, Ordering::SeqCst) {
+        let pid = CHILD_PID.load(Ordering::Relaxed);
+        if pid > 0 {
+            libc::kill(pid, libc::SIGINT);
+        }
+    }
+}
+
+fn setup_sigint_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigint_handler as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        // SA_RESTART: read_line などの遅いシスコールを自動再開させる
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
 
 fn parse_addr(s: &str, base: Option<u64>) -> Option<usize> {
     if let Some(rest) = s.strip_prefix("base+") {
@@ -387,6 +414,69 @@ fn print_disasm(dbg: &Debugger) {
     }
 }
 
+/// dis コマンドの実装。指定アドレス (またはPC) から count 命令を逆アセンブル表示します。
+fn show_disasm(
+    parts: &[&str],
+    dbg: &Debugger,
+    base: Option<u64>,
+    syms: Option<&Symbols>,
+) {
+    const DEFAULT_COUNT: usize = 10;
+    // 命令数の引数を探す（最後の引数が純粋な整数なら count とみなす）
+    let (loc_arg, count) = match parts {
+        [_, loc, n] => {
+            if let Ok(c) = n.parse::<usize>() {
+                (Some(*loc), c)
+            } else {
+                (Some(*loc), DEFAULT_COUNT)
+            }
+        }
+        [_, loc] => {
+            if let Ok(c) = loc.parse::<usize>() {
+                (None, c)
+            } else {
+                (Some(*loc), DEFAULT_COUNT)
+            }
+        }
+        _ => (None, DEFAULT_COUNT),
+    };
+
+    let addr = if let Some(loc) = loc_arg {
+        let cur_file = current_line(dbg, base, syms).map(|(f, _)| f);
+        match resolve_location(loc, base, syms, cur_file.as_deref()) {
+            Ok(a) => a as u64,
+            Err(e) => {
+                eprintln!("dis: {}", e);
+                return;
+            }
+        }
+    } else {
+        match dbg.pc() {
+            Ok(pc) => pc,
+            Err(e) => {
+                eprintln!("dis: failed to get PC: {}", e);
+                return;
+            }
+        }
+    };
+
+    // シンボル情報があれば関数名ヘッダを表示
+    if let (Some(syms), Some(base)) = (syms, base) {
+        let slide = syms.slide(base);
+        let vaddr = addr.wrapping_sub(slide);
+        if let Some((name, _)) = syms.find_symbol_for_addr(vaddr) {
+            println!("Dump of assembler code for function {}:", name);
+        }
+    }
+
+    // x86_64 の最大命令長は 15 バイト
+    let byte_len = count * 15;
+    match dbg.read_memory(addr as usize, byte_len) {
+        Ok(code) => disasm::print(&code, addr, count),
+        Err(e) => eprintln!("dis: failed to read memory: {}", e),
+    }
+}
+
 fn print_status(status: WaitStatus) {
     match status {
         WaitStatus::Stopped { signal, pc } => {
@@ -418,6 +508,10 @@ fn main() -> io::Result<()> {
     let mut dbg = Debugger::new(&program, &dbg_args)?;
     println!("Process started. pid={}", dbg.pid);
     print_status(dbg.last_status().unwrap());
+
+    // SIGINTを子プロセスへ転送するハンドラを設定
+    CHILD_PID.store(dbg.pid, Ordering::Relaxed);
+    setup_sigint_handler();
 
     let base = dbg.image_base().ok();
     let syms = match Symbols::load(&program) {
@@ -477,6 +571,7 @@ fn main() -> io::Result<()> {
                 println!("                               (e.g. $rax = 1, myvar = 42, 0x1000 = 0xab)");
                 println!("  r, regs, registers           show registers");
                 println!("  m, mem, memory <addr>        read 4 bytes at address");
+                println!("  dis [loc] [count]            disassemble instructions (default: PC, 10 insns)");
                 println!("  base                         show main executable load address");
                 println!("  q, quit, exit                quit");
             }
@@ -497,7 +592,9 @@ fn main() -> io::Result<()> {
                 }
             }
             "c" | "continue" | "cont" => {
+                CHILD_RUNNING.store(true, Ordering::SeqCst);
                 let status = dbg.cont()?;
+                CHILD_RUNNING.store(false, Ordering::SeqCst);
                 print_status(status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
@@ -505,7 +602,9 @@ fn main() -> io::Result<()> {
                 show_context(&dbg, base, syms.as_ref());
             }
             "s" | "step" => {
+                CHILD_RUNNING.store(true, Ordering::SeqCst);
                 let status = step_line(&mut dbg, base, syms.as_ref())?;
+                CHILD_RUNNING.store(false, Ordering::SeqCst);
                 print_status(status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
@@ -513,7 +612,9 @@ fn main() -> io::Result<()> {
                 show_context(&dbg, base, syms.as_ref());
             }
             "n" | "next" => {
+                CHILD_RUNNING.store(true, Ordering::SeqCst);
                 let status = next_line(&mut dbg, base, syms.as_ref())?;
+                CHILD_RUNNING.store(false, Ordering::SeqCst);
                 print_status(status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
@@ -521,7 +622,9 @@ fn main() -> io::Result<()> {
                 show_context(&dbg, base, syms.as_ref());
             }
             "si" | "stepi" => {
+                CHILD_RUNNING.store(true, Ordering::SeqCst);
                 let status = dbg.step()?;
+                CHILD_RUNNING.store(false, Ordering::SeqCst);
                 print_status(status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
@@ -529,7 +632,10 @@ fn main() -> io::Result<()> {
                 show_context(&dbg, base, syms.as_ref());
             }
             "up" | "finish" => {
-                match dbg.finish() {
+                CHILD_RUNNING.store(true, Ordering::SeqCst);
+                let result = dbg.finish();
+                CHILD_RUNNING.store(false, Ordering::SeqCst);
+                match result {
                     Ok(status) => {
                         print_status(status);
                         if matches!(status, WaitStatus::Exited { .. }) {
@@ -740,6 +846,9 @@ fn main() -> io::Result<()> {
                 } else {
                     eprintln!("invalid address");
                 }
+            }
+            "dis" | "disasm" | "disassemble" => {
+                show_disasm(&parts, &dbg, base, syms.as_ref());
             }
             "base" => {
                 match dbg.image_base() {

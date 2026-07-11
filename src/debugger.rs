@@ -288,9 +288,17 @@ impl Debugger {
     /// waitpid し、停止/終了/シグナル状態を判定します。
     fn wait(&mut self) -> io::Result<WaitStatus> {
         let mut status: i32 = 0;
-        let ret = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-        if ret == -1 {
-            return Err(io::Error::last_os_error());
+        loop {
+            let ret = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            if ret == -1 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    // シグナルで割り込まれた場合は再試行
+                    continue;
+                }
+                return Err(err);
+            }
+            break;
         }
 
         let pc = self.pc().unwrap_or(0);

@@ -1,5 +1,5 @@
 ---
 triple:          'x86_64-apple-darwin'
-binary-path:     'samples/hello'
+binary-path:     hello
 relocations:     []
 ...

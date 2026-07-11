@@ -3,7 +3,8 @@ DBG_ENT      := debugger-entitlements.plist
 SAMPLE_ENT   := samples/entitlements.xml
 SAMPLES      := samples/hello samples/sleep
 CC           := clang
-CFLAGS       := -g -O0 -arch arm64
+ARCH         := $(shell uname -m)
+CFLAGS       := -g -O0 -arch $(ARCH)
 
 .PHONY: all build sign samples clean
 
@@ -24,14 +25,14 @@ samples: $(SAMPLES)
 
 samples/hello: samples/hello.c
 	$(CC) $(CFLAGS) -c -o samples/hello.o $<
-	$(CC) -o $@ samples/hello.o
+	$(CC) $(CFLAGS) -o $@ samples/hello.o
 	dsymutil $@
 	rm -f samples/hello.o
 	codesign -s - --entitlements $(SAMPLE_ENT) -f $@
 
 samples/sleep: samples/sleep.c
 	$(CC) $(CFLAGS) -c -o samples/sleep.o $<
-	$(CC) -o $@ samples/sleep.o
+	$(CC) $(CFLAGS) -o $@ samples/sleep.o
 	dsymutil $@
 	rm -f samples/sleep.o
 	codesign -s - --entitlements $(SAMPLE_ENT) -f $@

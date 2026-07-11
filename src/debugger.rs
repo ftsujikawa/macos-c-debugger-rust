@@ -189,11 +189,6 @@ impl Debugger {
         mach::read_word(self.pid, addr)
     }
 
-    /// 指定アドレスに 8 バイトを書きます。
-    pub fn write_qword(&self, addr: usize, value: u64) -> io::Result<()> {
-        mach::write_memory(self.pid, addr, &value.to_le_bytes())
-    }
-
     /// 指定アドレスに任意バイト列を書きます。
     pub fn write_memory(&self, addr: usize, data: &[u8]) -> io::Result<()> {
         mach::write_memory(self.pid, addr, data)

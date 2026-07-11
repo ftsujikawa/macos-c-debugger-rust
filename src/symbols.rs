@@ -36,8 +36,6 @@ pub struct Variable {
     pub location: VarLocation,
     /// 型のバイト数（1・2・4・8 など）
     pub byte_size: u8,
-    /// 型名（取得できない場合は空）
-    pub type_name: String,
 }
 
 /// 変数の場所。
@@ -456,14 +454,13 @@ fn collect_variables<R: gimli::Reader>(
                 let Some(location) = parse_var_location(entry) else {
                     continue;
                 };
-                let (byte_size, type_name) = resolve_type_info(dwarf, unit, entry);
+                let (byte_size, _) = resolve_type_info(dwarf, unit, entry);
                 let scope = scope_stack.last().map(|(_, r)| *r);
                 variables.push(Variable {
                     name,
                     scope,
                     location,
                     byte_size,
-                    type_name,
                 });
             }
             _ => {}

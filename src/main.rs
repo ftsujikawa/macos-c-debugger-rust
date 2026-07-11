@@ -460,24 +460,25 @@ fn main() -> io::Result<()> {
         match parts[0] {
             "h" | "help" => {
                 println!("commands:");
-                println!("  h, help                 show this help");
-                println!("  b <loc>                 set breakpoint (addr | base+off | symbol | file:line)");
-                println!("  c, continue, cont       continue execution");
-                println!("  s, step                 step one source line (step into)");
-                println!("  n, next                 step one source line (step over)");
-                println!("  si, stepi               step one instruction");
-                println!("  up, finish              run until current function returns");
-                println!("  tb, bt, backtrace       show backtrace");
-                println!("  list, l [loc]           show source code (loc: line | file:line | symbol)");
-                println!("  syms, symbols [pat]     show loaded symbols (optional name filter)");
-                println!("  lines [pat]             show line number table (optional file filter)");
-                println!("  dbg, info               show debug info (symbols, line numbers, types)");
-                println!("  p[/FMT], print[/FMT] <expr>  evaluate and print (FMT: x X d u o t c a s)");
-                println!("  set <lvalue> = <expr>   set register or memory (e.g. $rax = 1, 0x1000 = 0xab)");
-                println!("  r, regs, registers      show registers");
-                println!("  m, mem, memory <addr>   read 4 bytes at address");
-                println!("  base                    show main executable load address");
-                println!("  q, quit, exit           quit");
+                println!("  h, help                      show this help");
+                println!("  b, break <loc>               set breakpoint (addr | base+off | symbol | file:line)");
+                println!("  c, continue, cont            continue execution");
+                println!("  s, step                      step one source line (step into)");
+                println!("  n, next                      step one source line (step over)");
+                println!("  si, stepi                    step one instruction");
+                println!("  up, finish                   run until current function returns");
+                println!("  tb, bt, backtrace            show backtrace");
+                println!("  list, l [loc]                show source code (loc: line | file:line | symbol)");
+                println!("  syms, symbols [pat]          show loaded symbols (optional name filter)");
+                println!("  lines [pat]                  show line number table (optional file filter)");
+                println!("  dbg, info                    show debug info (symbols, line numbers, types)");
+                println!("  p[/FMT], print[/FMT] <expr> evaluate and print (FMT: x X d u o t c a s)");
+                println!("  set <lvalue> = <expr>        set register, variable, or memory");
+                println!("                               (e.g. $rax = 1, myvar = 42, 0x1000 = 0xab)");
+                println!("  r, regs, registers           show registers");
+                println!("  m, mem, memory <addr>        read 4 bytes at address");
+                println!("  base                         show main executable load address");
+                println!("  q, quit, exit                quit");
             }
             "b" | "break" => {
                 if parts.len() < 2 {

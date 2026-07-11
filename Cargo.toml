@@ -1,0 +1,12 @@
+[package]
+name = "macos-c-debugger"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "A minimal C debugger base for macOS written in Rust"
+
+[dependencies]
+libc = "0.2"
+object = "0.36"
+gimli = "0.31"
+capstone = "0.12"

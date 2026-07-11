@@ -5,6 +5,10 @@ pub type Pid = libc::pid_t;
 
 // macOS ptrace requests
 pub const PT_TRACE_ME: c_int = 0;
+#[allow(dead_code)] pub const PT_READ_I: c_int = 1;
+#[allow(dead_code)] pub const PT_READ_D: c_int = 2;
+pub const PT_WRITE_I: c_int = 4;
+#[allow(dead_code)] pub const PT_WRITE_D: c_int = 5;
 pub const PT_CONTINUE: c_int = 7;
 pub const PT_KILL: c_int = 8;
 pub const PT_STEP: c_int = 9;
@@ -46,6 +50,20 @@ pub fn step(pid: Pid) -> std::io::Result<()> {
 pub fn kill(pid: Pid) -> std::io::Result<()> {
     unsafe { check(ptrace(PT_KILL, pid, std::ptr::null_mut(), 0), "PT_KILL") }
 }
+
+/// 4 バイトのワードをコードページに書き込みます (PT_WRITE_I)。
+/// addr は 4 バイトアライン必須。
+/// mach_vm_write が失敗する ARM64 コードページへの書き込みに使用します。
+#[cfg(target_arch = "aarch64")]
+pub fn write_code_word(pid: Pid, addr: usize, value: u32) -> std::io::Result<()> {
+    unsafe {
+        check(
+            ptrace(PT_WRITE_I, pid, addr as *mut c_void, value as c_int),
+            "PT_WRITE_I",
+        )
+    }
+}
+
 
 /// 子プロセスをデタッチします。
 #[allow(dead_code)]

@@ -335,5 +335,31 @@ impl FloatState64 {
     }
 }
 
+/// ARM64 デバッグ状態 (ARM_DEBUG_STATE64)
+/// ハードウェアブレークポイント / ウォッチポイントレジスタを保持する。
+///
+/// AArch64 デバッグアーキテクチャ:
+///   BVR[n] = ブレークポイントアドレス
+///   BCR[n] = ブレークポイント制御
+///   WVR[n] = ウォッチポイントアドレス
+///   WCR[n] = ウォッチポイント制御
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Default, Clone, Debug)]
+pub struct ArmDebugState64 {
+    pub bvr: [u64; 16],
+    pub bcr: [u64; 16],
+    pub wvr: [u64; 16],
+    pub wcr: [u64; 16],
+    pub mdscr_el1: u64,
+}
+
+/// BCR の基本制御値 (ユーザ空間アドレスブレークポイント)
+///   E   bit[0]   = 1  (有効)
+///   PMC bit[2:1] = 10 (EL0 のみ)
+///   BAS bit[8:5] = 1111 (4 バイト命令全バイトマッチ)
+#[cfg(target_arch = "aarch64")]
+pub const HW_BP_BCR_ENABLE: u64 = 0x1E5;
+
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("unsupported architecture: this debugger base is only for x86_64 or aarch64 macOS");

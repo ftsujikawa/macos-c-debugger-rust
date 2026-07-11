@@ -1,3 +1,4 @@
+mod arch;
 mod breakpoint;
 mod debugger;
 mod disasm;

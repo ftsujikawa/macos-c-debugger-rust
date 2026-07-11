@@ -1,9 +1,12 @@
 use std::os::raw::c_int;
 
-use crate::ptrace::Pid;
+use crate::arch::Arch;
+use crate::ptrace::{self, Pid};
 use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
 use crate::register::FloatState64;
+#[cfg(target_arch = "aarch64")]
+use crate::register::{ArmDebugState64, HW_BP_BCR_ENABLE};
 
 pub type MachPort = u32;
 pub type KernReturn = c_int;
@@ -17,6 +20,10 @@ const FLOAT_STATE64_COUNT: u32 = 131; // x86_FLOAT_STATE64_COUNT (524 bytes / 4)
 
 #[cfg(target_arch = "aarch64")]
 const THREAD_STATE64_FLAVOR: i32 = 6; // ARM_THREAD_STATE64
+#[cfg(target_arch = "aarch64")]
+const ARM_DEBUG_STATE64_FLAVOR: i32 = 15; // ARM_DEBUG_STATE64
+#[cfg(target_arch = "aarch64")]
+const ARM_DEBUG_STATE64_COUNT: u32 = 130; // 520 bytes / 4 (bvr[16]+bcr[16]+wvr[16]+wcr[16]+mdscr_el1)
 
 #[allow(dead_code)]
 const VM_PROT_NONE: i32 = 0x00;
@@ -221,8 +228,73 @@ pub fn set_registers(pid: Pid, state: &ThreadState64) -> std::io::Result<()> {
     }
 }
 
+/// ARM64 ハードウェアデバッグ状態を取得します。
+#[cfg(target_arch = "aarch64")]
+pub fn get_debug_state(pid: Pid) -> std::io::Result<ArmDebugState64> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let mut state = ArmDebugState64::default();
+        let mut count = ARM_DEBUG_STATE64_COUNT;
+        let ret = thread_get_state(
+            thread,
+            ARM_DEBUG_STATE64_FLAVOR,
+            &mut state as *mut ArmDebugState64 as *mut u32,
+            &mut count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        mach_err(ret, "thread_get_state (debug)")?;
+        Ok(state)
+    }
+}
+
+/// ARM64 ハードウェアデバッグ状態を設定します。
+#[cfg(target_arch = "aarch64")]
+pub fn set_debug_state(pid: Pid, state: &ArmDebugState64) -> std::io::Result<()> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let count = ARM_DEBUG_STATE64_COUNT;
+        let ret = thread_set_state(
+            thread,
+            ARM_DEBUG_STATE64_FLAVOR,
+            state as *const ArmDebugState64 as *const u32,
+            count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        mach_err(ret, "thread_set_state (debug)")?;
+        Ok(())
+    }
+}
+
+/// 指定スロットにハードウェアブレークポイントを設定します。
+/// slot は 0..16 の範囲。
+#[cfg(target_arch = "aarch64")]
+pub fn set_hw_breakpoint_slot(pid: Pid, slot: usize, addr: usize) -> std::io::Result<()> {
+    assert!(slot < 16, "HW BP slot must be 0..15");
+    let mut state = get_debug_state(pid)?;
+    state.bvr[slot] = addr as u64;
+    state.bcr[slot] = HW_BP_BCR_ENABLE;
+    set_debug_state(pid, &state)
+}
+
+/// 指定スロットのハードウェアブレークポイントをクリアします。
+#[cfg(target_arch = "aarch64")]
+pub fn clear_hw_breakpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
+    assert!(slot < 16, "HW BP slot must be 0..15");
+    let mut state = get_debug_state(pid)?;
+    state.bvr[slot] = 0;
+    state.bcr[slot] = 0;
+    set_debug_state(pid, &state)
+}
+
 /// 指定アドレスから `size` バイトを読みます。
 pub fn read_memory(pid: Pid, addr: usize, size: usize) -> std::io::Result<Vec<u8>> {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
     let task = get_task(pid)?;
     unsafe {
         let mut data: usize = 0;
@@ -235,6 +307,10 @@ pub fn read_memory(pid: Pid, addr: usize, size: usize) -> std::io::Result<Vec<u8
                 format!("mach_vm_read: error {}", ret),
             ));
         }
+        if data == 0 || cnt == 0 {
+            let _ = mach_port_deallocate(task_self(), task);
+            return Ok(Vec::new());
+        }
         let slice = std::slice::from_raw_parts(data as *const u8, cnt as usize);
         let result = slice.to_vec();
         let _ = vm_deallocate(task_self(), data, cnt as usize);
@@ -243,8 +319,18 @@ pub fn read_memory(pid: Pid, addr: usize, size: usize) -> std::io::Result<Vec<u8
     }
 }
 
-/// 指定アドレスに `data` を書き込みます。コードページの場合は
-/// `VM_PROT_COPY` を使って一時的に書き込み可能にします。
+/// 指定アドレスに `data` を書き込みます。
+///
+/// コードページへの書き込み戦略 (ARM64 Apple Silicon 対応):
+///
+/// exec 直後の最初の停止では max_prot=rwx なので VM_PROT_COPY が使える。
+/// プロセスが一度実行を開始するとコードサイニングにより max_prot が r-x に固定され、
+/// VM_PROT_COPY は KERN_PROTECTION_FAILURE を返すようになる。
+///
+/// 戦略1: VM_PROT_COPY で CoW 書き込み (exec 直後に成功)
+/// 戦略2: mach_vm_write 直接 (cs.debugger + get-task-allow 環境では
+///         カーネルがデバッガの書き込みを特別許可することがある)
+/// 戦略3: 戦略1 と 2 が両方失敗した場合はエラーを返す
 pub fn write_memory(pid: Pid, addr: usize, data: &[u8]) -> std::io::Result<()> {
     let task = get_task(pid)?;
     unsafe {
@@ -276,39 +362,55 @@ pub fn write_memory(pid: Pid, addr: usize, data: &[u8]) -> std::io::Result<()> {
         let page = (addr as u64) & !(PAGE_MASK as u64);
         let page_size = PAGE_SIZE as u64;
 
-        // 既に書き込み可能なら mach_vm_protect は不要
         let needs_protect = original_prot & VM_PROT_WRITE == 0;
+        let mut protection_changed = false;
+        let mut protect_err = 0i32;
+
         if needs_protect {
+            // 戦略1: VM_PROT_COPY で CoW 書き込み (exec 直後の max_prot=rwx 時に成功)
             let write_prot = if max_prot & VM_PROT_WRITE != 0 {
                 original_prot | VM_PROT_WRITE
             } else {
                 VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY
             };
             let ret = mach_vm_protect(task, page, page_size, 0, write_prot);
-            if ret != 0 {
-                let _ = mach_port_deallocate(task_self(), task);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("mach_vm_protect: error {}", ret),
-                ));
+            if ret == 0 {
+                protection_changed = true;
+            } else {
+                // 戦略1 失敗: protect エラーを記録しておく
+                // 戦略2 (直接書き込み) を次に試みる
+                protect_err = ret;
             }
         }
 
+        // 書き込みを試みる (戦略1 で保護変更済みか、戦略2 として直接試みる)
         let ret = mach_vm_write(task, addr as u64, data.as_ptr() as usize, data.len() as u32);
-        if ret != 0 {
-            if needs_protect {
-                let _ = mach_vm_protect(task, page, page_size, 0, original_prot);
-            }
-            let _ = mach_port_deallocate(task_self(), task);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("mach_vm_write: error {}", ret),
-            ));
-        }
 
-        if needs_protect {
+        if needs_protect && protection_changed {
             let _ = mach_vm_protect(task, page, page_size, 0, original_prot);
         }
+
+        if ret != 0 {
+            // 戦略3 (ARM64 のみ): ptrace(PT_WRITE_I) でコードページに書き込む
+            // mach_vm_write が KERN_INVALID_ADDRESS を返す場合の代替手段
+            #[cfg(target_arch = "aarch64")]
+            if data.len() == 4 && addr % 4 == 0 {
+                let word = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                if ptrace::write_code_word(pid, addr, word).is_ok() {
+                    let _ = mach_port_deallocate(task_self(), task);
+                    return Ok(());
+                }
+            }
+
+            let _ = mach_port_deallocate(task_self(), task);
+            let msg = if needs_protect && !protection_changed {
+                format!("mach_vm_protect: error {} (write also failed: {})", protect_err, ret)
+            } else {
+                format!("mach_vm_write: error {}", ret)
+            };
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+        }
+
         let _ = mach_port_deallocate(task_self(), task);
         Ok(())
     }
@@ -389,6 +491,25 @@ pub fn get_text_base(pid: Pid) -> std::io::Result<u64> {
             std::io::ErrorKind::Other,
             "main executable base not found",
         ))
+    }
+}
+
+/// 子プロセスの Mach-O ヘッダを読み、CPU アーキテクチャを返します。
+/// Mach-O 64 ヘッダ: [magic:4][cpu_type:4][cpu_subtype:4]...
+/// CPU_TYPE_X86_64  = 0x01000007
+/// CPU_TYPE_ARM64   = 0x0100000C
+pub fn detect_arch(pid: Pid) -> std::io::Result<Arch> {
+    let base = get_text_base(pid)?;
+    // magic の直後 4 バイトが cpu_type
+    let buf = read_memory(pid, base as usize + 4, 4)?;
+    let cpu_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    match cpu_type {
+        0x01000007 => Ok(Arch::X86_64),
+        0x0100000C => Ok(Arch::Aarch64),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("unknown cpu_type in Mach-O header: {:#010x}", cpu_type),
+        )),
     }
 }
 

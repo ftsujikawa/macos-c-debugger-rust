@@ -88,41 +88,51 @@ impl Debugger {
     }
 
     /// リターンアドレスを取得します。
-    /// プロローグの実行状態（rbp/fp と rsp/sp の大小関係）に応じて取得先を切り替えます。
+    /// 現在の命令バイトを読んでプロローグの実行段階を正確に判定します。
     fn return_address(&self) -> io::Result<usize> {
         let regs = self.registers()?;
+        let pc = regs.pc() as usize;
 
         #[cfg(target_arch = "x86_64")]
         {
             let rbp = regs.__rbp as usize;
             let rsp = regs.__rsp as usize;
-            if rbp > rsp {
-                // プロローグ前: [rsp] の値が rbp と等しければ push rbp 済み → [rsp+8]
-                //               そうでなければ [rsp] がリターンアドレス
+
+            // 現在の命令バイトでプロローグ段階を判定
+            let instr = self.read_memory(pc, 3).unwrap_or_default();
+            let ret_addr = if instr.first().copied() == Some(0x55) {
+                // push rbp の直前:
+                //   rsp → [return_address]
                 let buf = self.read_memory(rsp, 8)?;
-                let at_rsp = u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize;
-                if at_rsp == rbp {
-                    let buf = self.read_memory(rsp + 8, 8)?;
-                    Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize)
-                } else {
-                    Ok(at_rsp)
-                }
+                u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize
+            } else if instr.starts_with(&[0x48, 0x89, 0xe5]) {
+                // push rbp 完了・mov rbp, rsp の直前:
+                //   rsp → [saved_rbp], rsp+8 → [return_address]
+                let buf = self.read_memory(rsp + 8, 8)?;
+                u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize
             } else {
-                // プロローグ後: [rbp+8] がリターンアドレス
+                // プロローグ完了後の通常フレーム:
+                //   rbp → [saved_rbp], rbp+8 → [return_address]
                 let buf = self.read_memory(rbp + 8, 8)?;
-                Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize)
-            }
+                u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize
+            };
+            Ok(ret_addr)
         }
 
         #[cfg(target_arch = "aarch64")]
         {
             let fp = regs.__fp as usize;
             let sp = regs.__sp as usize;
-            if fp == 0 || fp > sp {
-                // プロローグ前: lr レジスタがリターンアドレス
+
+            // 現在の命令バイトでプロローグ段階を判定
+            // stp x29, x30, [sp, #-16]! = 0xFD 0x7B 0xBF 0xA9
+            let instr = self.read_memory(pc, 4).unwrap_or_default();
+            if instr.starts_with(&[0xfd, 0x7b, 0xbf, 0xa9]) || fp == 0 {
+                // stp 命令の直前 (lr がまだスタックに保存されていない):
+                // lr レジスタがリターンアドレス
                 Ok(regs.__lr as usize)
             } else {
-                // プロローグ後: [fp+8] がリターンアドレス
+                // プロローグ完了後: [fp+8] がリターンアドレス (保存済み lr)
                 let buf = self.read_memory(fp + 8, 8)?;
                 Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize)
             }
@@ -150,12 +160,75 @@ impl Debugger {
         Ok(status)
     }
 
+    /// 関数先頭アドレスからプロローグ命令をスキップした最初の本体命令のアドレスを返します。
+    /// プロセスのメモリを直接読んで判定するため、DWARF 情報がなくても動作します。
+    ///
+    /// x86_64: push rbp / mov rbp, rsp / [sub rsp, N] をスキップ
+    /// aarch64: stp x29, x30, [sp, #-16]! / mov x29, sp / [sub sp, sp, N] をスキップ
+    pub fn skip_prologue_insns(&self, addr: usize) -> usize {
+        let Ok(code) = self.read_memory(addr, 16) else {
+            return addr;
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut off = 0usize;
+            // push rbp (55)
+            if code.get(off) != Some(&0x55) {
+                return addr;
+            }
+            off += 1;
+            // mov rbp, rsp (48 89 e5)
+            if code.get(off..off + 3) != Some(&[0x48, 0x89, 0xe5]) {
+                return addr + off;
+            }
+            off += 3;
+            // optional: sub rsp, imm8  (48 83 ec XX)
+            //        or  sub rsp, imm32 (48 81 ec XX XX XX XX)
+            if code.get(off..off + 3) == Some(&[0x48, 0x83, 0xec]) {
+                off += 4;
+            } else if code.get(off..off + 3) == Some(&[0x48, 0x81, 0xec]) {
+                off += 7;
+            }
+            addr + off
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut off = 0usize;
+            // stp x29, x30, [sp, #-16]!  (fd 7b bf a9)
+            if code.get(off..off + 4) != Some(&[0xfd, 0x7b, 0xbf, 0xa9]) {
+                return addr;
+            }
+            off += 4;
+            // mov x29, sp  (fd 03 00 91)
+            if code.get(off..off + 4) != Some(&[0xfd, 0x03, 0x00, 0x91]) {
+                return addr + off;
+            }
+            off += 4;
+            // optional: sub sp, sp, #N  (ff XX XX d1)
+            if code.get(off + 3) == Some(&0xd1)
+                && code.get(off..off + 2) == Some(&[0xff, 0xff])
+            {
+                off += 4;
+            }
+            addr + off
+        }
+    }
+
     /// ブレークポイントを設定します。
     pub fn set_breakpoint(&mut self, addr: usize) -> io::Result<()> {
         let mut bp = Breakpoint::new(addr);
         bp.enable(self.pid)?;
         self.breakpoints.insert(addr, bp);
         Ok(())
+    }
+
+    /// 設定済みブレークポイントのアドレス一覧をソートして返します。
+    pub fn breakpoint_addrs(&self) -> Vec<usize> {
+        let mut addrs: Vec<usize> = self.breakpoints.keys().cloned().collect();
+        addrs.sort();
+        addrs
     }
 
     /// ブレークポイントを削除します。

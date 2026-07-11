@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use debugger::{Debugger, WaitStatus};
-use symbols::{Symbols, VarLocation};
+use symbols::{FrameBaseDef, Symbols, Variable, VarLocation};
 
 /// SIGINTを転送する先の子プロセスPID (0 = 未設定)
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
@@ -125,6 +125,62 @@ fn eval_expression(
     expr::eval(&expr, &ctx)
 }
 
+/// DW_AT_frame_base に基づいてフレームベースアドレスを計算します。
+/// CFA (Canonical Frame Address) の場合:
+///   x86_64: CFA = rbp + 16
+///   aarch64: CFA = fp + frame_size (プロローグの stp 命令から取得)
+fn compute_frame_base(dbg: &Debugger, var: &Variable, slide: u64) -> io::Result<u64> {
+    use register::ThreadState64;
+    let regs: ThreadState64 = dbg.registers()?;
+    let bp = regs.bp();
+    let _ = slide; // x86_64 では使わないがシグネチャを統一するため
+
+    match var.frame_base {
+        FrameBaseDef::Register => Ok(bp),
+        FrameBaseDef::CallFrameCfa => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // x86_64 標準フレーム: push rbp → rbp+0=saved_rbp, rbp+8=ret_addr → CFA=rbp+16
+                Ok(bp + 16)
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // aarch64: stp x29,x30,[sp,#-N]!; mov x29,sp → CFA = fp + N
+                // 関数先頭の stp 命令から N (frame_size) を読み取る
+                let frame_size = if let Some((scope_low, _)) = var.scope {
+                    let func_start = scope_low.wrapping_add(slide) as usize;
+                    if let Ok(bytes) = dbg.read_memory(func_start, 4) {
+                        if bytes.len() == 4
+                            && bytes[0] == 0xfd  // Rt = x29
+                            && bytes[1] == 0x7b  // Rt2 = x30, Rn upper bits
+                            && bytes[3] == 0xa9  // STP opcode (64-bit pre-index)
+                        {
+                            // imm7 は命令の bit[21:15]
+                            let word =
+                                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                            let imm7_raw = (word >> 15) & 0x7f;
+                            let imm7 = if imm7_raw & 0x40 != 0 {
+                                (imm7_raw as i64) - 128
+                            } else {
+                                imm7_raw as i64
+                            };
+                            (-imm7 * 8) as u64
+                        } else {
+                            0 // stp 命令なし（フレームポインタ不使用の葉関数等）
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                Ok(bp + frame_size)
+            }
+        }
+    }
+}
+
 /// 変数名を実行時の (アドレス, バイト数) に解決します。
 fn resolve_variable(
     dbg: &Debugger,
@@ -141,8 +197,8 @@ fn resolve_variable(
         .ok_or_else(|| format!("variable not found: {}", name))?;
     let addr = match var.location {
         VarLocation::FrameOffset(off) => {
-            let regs = dbg.registers().map_err(|e| e.to_string())?;
-            (regs.bp() as i64).wrapping_add(off) as u64
+            let fb = compute_frame_base(dbg, var, slide).map_err(|e| e.to_string())?;
+            (fb as i64).wrapping_add(off) as u64
         }
         VarLocation::Addr(a) => a.wrapping_add(slide),
     };
@@ -477,6 +533,130 @@ fn show_disasm(
     }
 }
 
+/// 変数の実行時の値を読み取ります。失敗したら None を返します。
+fn read_var_value(dbg: &Debugger, var: &Variable, slide: u64) -> Option<i64> {
+    let addr = match var.location {
+        VarLocation::FrameOffset(off) => {
+            let fb = compute_frame_base(dbg, var, slide).ok()?;
+            (fb as i64).wrapping_add(off) as usize
+        }
+        VarLocation::Addr(a) => a.wrapping_add(slide) as usize,
+    };
+    let size = var.byte_size.clamp(1, 8) as usize;
+    let bytes = dbg.read_memory(addr, size).ok()?;
+    let mut buf = [0u8; 8];
+    buf[..size].copy_from_slice(&bytes[..size]);
+    Some(i64::from_le_bytes(buf))
+}
+
+/// 変数一覧を「name = value  (0xhex)」の形式で表示します。
+fn print_vars(dbg: &Debugger, vars: &[&Variable], slide: u64) {
+    if vars.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    for var in vars {
+        match read_var_value(dbg, var, slide) {
+            Some(v) => println!("  {} = {}  ({:#x})", var.name, v, v as u64),
+            None => println!("  {} = <unavailable>", var.name),
+        }
+    }
+}
+
+/// show コマンドの実装。
+fn show_command(
+    parts: &[&str],
+    dbg: &Debugger,
+    base: Option<u64>,
+    syms: Option<&Symbols>,
+) {
+    let sub = match parts.get(1) {
+        Some(s) => *s,
+        None => {
+            eprintln!("usage: show bp|locals|args|globals");
+            return;
+        }
+    };
+
+    match sub {
+        "bp" => {
+            let addrs = dbg.breakpoint_addrs();
+            if addrs.is_empty() {
+                println!("No breakpoints.");
+                return;
+            }
+            for (i, addr) in addrs.iter().enumerate() {
+                let mut desc = String::new();
+                if let (Some(syms), Some(base)) = (syms, base) {
+                    let slide = syms.slide(base);
+                    let vaddr = (*addr as u64).wrapping_sub(slide);
+                    if let Some((name, off)) = syms.find_symbol_for_addr(vaddr) {
+                        if off == 0 {
+                            desc.push_str(&format!("  {}", name));
+                        } else {
+                            desc.push_str(&format!("  {} + {:#x}", name, off));
+                        }
+                    }
+                    if let Some((path, line)) = syms.find_location(vaddr) {
+                        desc.push_str(&format!("  ({}:{})", path, line));
+                    }
+                }
+                println!("#{:<2} {:#018x}{}", i + 1, addr, desc);
+            }
+        }
+        "locals" => {
+            let Some(syms) = syms else {
+                eprintln!("show locals: no debug info loaded");
+                return;
+            };
+            let Some(base) = base else {
+                eprintln!("show locals: image base unknown");
+                return;
+            };
+            let slide = syms.slide(base);
+            let pc = match dbg.pc() {
+                Ok(p) => p,
+                Err(e) => { eprintln!("show locals: {}", e); return; }
+            };
+            let pc_vaddr = pc.wrapping_sub(slide);
+            let vars = syms.locals_at_pc(pc_vaddr);
+            print_vars(dbg, &vars, slide);
+        }
+        "args" => {
+            let Some(syms) = syms else {
+                eprintln!("show args: no debug info loaded");
+                return;
+            };
+            let Some(base) = base else {
+                eprintln!("show args: image base unknown");
+                return;
+            };
+            let slide = syms.slide(base);
+            let pc = match dbg.pc() {
+                Ok(p) => p,
+                Err(e) => { eprintln!("show args: {}", e); return; }
+            };
+            let pc_vaddr = pc.wrapping_sub(slide);
+            let vars = syms.args_at_pc(pc_vaddr);
+            print_vars(dbg, &vars, slide);
+        }
+        "globals" => {
+            let Some(syms) = syms else {
+                eprintln!("show globals: no debug info loaded");
+                return;
+            };
+            let Some(base) = base else {
+                eprintln!("show globals: image base unknown");
+                return;
+            };
+            let slide = syms.slide(base);
+            let vars = syms.global_variables();
+            print_vars(dbg, &vars, slide);
+        }
+        _ => eprintln!("show: unknown subcommand '{}' (bp|locals|args|globals)", sub),
+    }
+}
+
 fn print_status(status: WaitStatus) {
     match status {
         WaitStatus::Stopped { signal, pc } => {
@@ -513,7 +693,7 @@ fn main() -> io::Result<()> {
     CHILD_PID.store(dbg.pid, Ordering::Relaxed);
     setup_sigint_handler();
 
-    let base = dbg.image_base().ok();
+    let mut base = dbg.image_base().ok();
     let syms = match Symbols::load(&program) {
         Ok(s) => {
             println!(
@@ -539,6 +719,15 @@ fn main() -> io::Result<()> {
     let mut line = String::new();
 
     loop {
+        // 起動直後は task_for_pid が未準備で失敗することがあるため、
+        // base が取れていないときはコマンドごとに再取得を試みる
+        if base.is_none() {
+            base = dbg.image_base().ok();
+            if base.is_some() {
+                println!("image base: {:#018x}", base.unwrap());
+            }
+        }
+
         print!("(dbg) ");
         io::stdout().flush()?;
         line.clear();
@@ -556,6 +745,7 @@ fn main() -> io::Result<()> {
                 println!("commands:");
                 println!("  h, help                      show this help");
                 println!("  b, break <loc>               set breakpoint (addr | base+off | symbol | file:line)");
+                println!("  del, delete <N|addr|all>     delete breakpoint by number, address, or all");
                 println!("  c, continue, cont            continue execution");
                 println!("  s, step                      step one source line (step into)");
                 println!("  n, next                      step one source line (step over)");
@@ -572,6 +762,10 @@ fn main() -> io::Result<()> {
                 println!("  r, regs, registers           show registers");
                 println!("  m, mem, memory <addr>        read 4 bytes at address");
                 println!("  dis [loc] [count]            disassemble instructions (default: PC, 10 insns)");
+                println!("  show bp                      list breakpoints");
+                println!("  show locals                  list local variables at current PC");
+                println!("  show args                    list function arguments at current PC");
+                println!("  show globals                 list global variables");
                 println!("  base                         show main executable load address");
                 println!("  q, quit, exit                quit");
             }
@@ -583,12 +777,54 @@ fn main() -> io::Result<()> {
                 let cur_file = current_line(&dbg, base, syms.as_ref()).map(|(f, _)| f);
                 match resolve_location(parts[1], base, syms.as_ref(), cur_file.as_deref()) {
                     Ok(addr) => {
+                        // シンボル名指定のとき、プロローグをスキップした位置に設定する
+                        // (DWARF に行情報がない場合のフォールバックとして命令バイトで判定)
+                        let addr = if is_identifier(parts[1]) {
+                            dbg.skip_prologue_insns(addr)
+                        } else {
+                            addr
+                        };
                         dbg.set_breakpoint(addr)?;
                         println!("Breakpoint set at {:#018x}", addr);
                     }
                     Err(e) => {
                         eprintln!("could not resolve location {}: {}", parts[1], e);
                     }
+                }
+            }
+            "del" | "delete" => {
+                if parts.len() < 2 {
+                    eprintln!("usage: del <number> | del <addr> | del all");
+                    continue;
+                }
+                if parts[1] == "all" {
+                    let addrs = dbg.breakpoint_addrs();
+                    for addr in addrs {
+                        if let Err(e) = dbg.remove_breakpoint(addr) {
+                            eprintln!("del: {}", e);
+                        }
+                    }
+                    println!("All breakpoints deleted.");
+                } else if let Ok(n) = parts[1].parse::<usize>() {
+                    // 番号指定（show bp の #N）
+                    let addrs = dbg.breakpoint_addrs();
+                    if n == 0 || n > addrs.len() {
+                        eprintln!("del: breakpoint #{} not found (use 'show bp' to list)", n);
+                    } else {
+                        let addr = addrs[n - 1];
+                        match dbg.remove_breakpoint(addr) {
+                            Ok(()) => println!("Breakpoint #{} ({:#018x}) deleted.", n, addr),
+                            Err(e) => eprintln!("del: {}", e),
+                        }
+                    }
+                } else if let Some(addr) = parse_addr(parts[1], base) {
+                    // アドレス直接指定
+                    match dbg.remove_breakpoint(addr) {
+                        Ok(()) => println!("Breakpoint at {:#018x} deleted.", addr),
+                        Err(e) => eprintln!("del: {}", e),
+                    }
+                } else {
+                    eprintln!("del: invalid argument '{}' (use number or address)", parts[1]);
                 }
             }
             "c" | "continue" | "cont" => {
@@ -705,58 +941,66 @@ fn main() -> io::Result<()> {
                     continue;
                 }
                 match eval_expression(&dbg, base, syms.as_ref(), expr_str) {
-                    Ok(v) => match fmt {
-                        Some('x') => println!("{:#018x}", v),
-                        Some('X') => println!("{:#018X}", v),
-                        Some('d') => println!("{}", v as i64),
-                        Some('u') => println!("{}", v),
-                        Some('o') => println!("{:#o}", v),
-                        Some('t') => println!("{:#b}", v),
-                        Some('c') => {
-                            let ch = char::from_u32(v as u32).unwrap_or('?');
-                            if ch.is_ascii_graphic() || ch == ' ' {
-                                println!("{} '{}'", v as i64, ch);
-                            } else {
-                                println!("{} '\\x{:02x}'", v as i64, v as u8);
-                            }
-                        }
-                        Some('a') => println!("{:#018x}", v),
-                        Some('s') => {
-                            // vをポインタとしてnull終端文字列を読む
-                            let mut addr = v as usize;
-                            let mut s = String::new();
-                            'read: loop {
-                                match dbg.read_memory(addr, 64) {
-                                    Ok(chunk) => {
-                                        for &b in &chunk {
-                                            if b == 0 {
-                                                break 'read;
-                                            }
-                                            if b.is_ascii_graphic() || b == b' ' {
-                                                s.push(b as char);
-                                            } else {
-                                                s.push_str(&format!("\\x{:02x}", b));
-                                            }
-                                        }
-                                        addr += chunk.len();
-                                    }
-                                    Err(e) => {
-                                        eprintln!("print: failed to read string at {:#x}: {}", v, e);
-                                        break;
-                                    }
+                    Ok(v) => {
+                        // 変数名のとき "name = " プレフィックスを付ける
+                        let prefix = if is_identifier(expr_str) {
+                            format!("{} = ", expr_str)
+                        } else {
+                            String::new()
+                        };
+                        match fmt {
+                            Some('x') => println!("{}{:#018x}", prefix, v),
+                            Some('X') => println!("{}{:#018X}", prefix, v),
+                            Some('d') => println!("{}{}", prefix, v as i64),
+                            Some('u') => println!("{}{}", prefix, v),
+                            Some('o') => println!("{}{:#o}", prefix, v),
+                            Some('t') => println!("{}{:#b}", prefix, v),
+                            Some('c') => {
+                                let ch = char::from_u32(v as u32).unwrap_or('?');
+                                if ch.is_ascii_graphic() || ch == ' ' {
+                                    println!("{}{} '{}'", prefix, v as i64, ch);
+                                } else {
+                                    println!("{}{} '\\x{:02x}'", prefix, v as i64, v as u8);
                                 }
                             }
-                            println!("{:#018x}  \"{}\"", v, s);
-                        }
-                        Some(f) => eprintln!("print: unknown format '{}'", f),
-                        None => {
-                            if is_identifier(expr_str) {
-                                println!("{}  ({:#x})", v as i64, v);
-                            } else {
-                                println!("{:#018x}  ({})", v, v);
+                            Some('a') => println!("{}{:#018x}", prefix, v),
+                            Some('s') => {
+                                // vをポインタとしてnull終端文字列を読む
+                                let mut addr = v as usize;
+                                let mut s = String::new();
+                                'read: loop {
+                                    match dbg.read_memory(addr, 64) {
+                                        Ok(chunk) => {
+                                            for &b in &chunk {
+                                                if b == 0 {
+                                                    break 'read;
+                                                }
+                                                if b.is_ascii_graphic() || b == b' ' {
+                                                    s.push(b as char);
+                                                } else {
+                                                    s.push_str(&format!("\\x{:02x}", b));
+                                                }
+                                            }
+                                            addr += chunk.len();
+                                        }
+                                        Err(e) => {
+                                            eprintln!("print: failed to read string at {:#x}: {}", v, e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                println!("{}{:#018x}  \"{}\"", prefix, v, s);
+                            }
+                            Some(f) => eprintln!("print: unknown format '{}'", f),
+                            None => {
+                                if is_identifier(expr_str) {
+                                    println!("{}{}  ({:#x})", prefix, v as i64, v);
+                                } else {
+                                    println!("{:#018x}  ({})", v, v);
+                                }
                             }
                         }
-                    },
+                    }
                     Err(e) => eprintln!("print: {}", e),
                 }
             }
@@ -830,7 +1074,11 @@ fn main() -> io::Result<()> {
                         eprintln!("failed to write memory: {}", e);
                         continue;
                     }
-                    println!("[{:#018x}] = {}", addr, value as i64);
+                    if is_identifier(target) {
+                        println!("{} = {}", target, value as i64);
+                    } else {
+                        println!("[{:#018x}] = {}", addr, value as i64);
+                    }
                 }
             }
             "m" | "mem" | "memory" => {
@@ -849,6 +1097,9 @@ fn main() -> io::Result<()> {
             }
             "dis" | "disasm" | "disassemble" => {
                 show_disasm(&parts, &dbg, base, syms.as_ref());
+            }
+            "show" => {
+                show_command(&parts, &dbg, base, syms.as_ref());
             }
             "base" => {
                 match dbg.image_base() {

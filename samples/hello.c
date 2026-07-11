@@ -12,5 +12,10 @@ int main() {
     int result = add(2, 3);
     printf("2 + 3 = %d\n", result);
     
+    int i = 0;
+    while(1) {
+        printf("result = %d\n", i++);
+    }
+
     return 0;
 }

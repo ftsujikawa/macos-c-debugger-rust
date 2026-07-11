@@ -25,6 +25,18 @@ pub struct Symbols {
     variables: Vec<Variable>,
 }
 
+/// DW_AT_frame_base の種類。DW_OP_fbreg のオフセット基準を決定します。
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FrameBaseDef {
+    /// DW_OP_reg6 (x86_64 rbp) / DW_OP_reg29 (aarch64 fp) など: レジスタ直接
+    #[default]
+    Register,
+    /// DW_OP_call_frame_cfa: CFA 基準
+    /// x86_64: CFA = rbp + 16
+    /// aarch64: CFA = fp + frame_size (プロローグ命令から判定)
+    CallFrameCfa,
+}
+
 /// DWARF から読み取った変数 1 つ分の情報。
 #[derive(Debug, Clone)]
 pub struct Variable {
@@ -36,6 +48,10 @@ pub struct Variable {
     pub location: VarLocation,
     /// 型のバイト数（1・2・4・8 など）
     pub byte_size: u8,
+    /// 関数の仮引数 (DW_TAG_formal_parameter) のとき true
+    pub is_arg: bool,
+    /// DW_OP_fbreg のオフセット基準
+    pub frame_base: FrameBaseDef,
 }
 
 /// 変数の場所。
@@ -98,6 +114,39 @@ impl Symbols {
     /// 読み込んだ型名の数を返します。
     pub fn type_count(&self) -> usize {
         self.type_names.len()
+    }
+
+    /// PC（ファイル上の仮想アドレス）のスコープ内にあるローカル変数を返します。
+    /// 複数のスコープにまたがる変数（外側のブロックも含む）をすべて返します。
+    pub fn locals_at_pc(&self, pc_vaddr: u64) -> Vec<&Variable> {
+        self.variables
+            .iter()
+            .filter(|v| !v.is_arg)
+            .filter(|v| match v.scope {
+                Some((low, high)) => low <= pc_vaddr && pc_vaddr < high,
+                None => false,
+            })
+            .collect()
+    }
+
+    /// PC（ファイル上の仮想アドレス）のスコープ内にある関数引数を返します。
+    pub fn args_at_pc(&self, pc_vaddr: u64) -> Vec<&Variable> {
+        self.variables
+            .iter()
+            .filter(|v| v.is_arg)
+            .filter(|v| match v.scope {
+                Some((low, high)) => low <= pc_vaddr && pc_vaddr < high,
+                None => false,
+            })
+            .collect()
+    }
+
+    /// グローバル変数（スコープなし）の一覧を返します。
+    pub fn global_variables(&self) -> Vec<&Variable> {
+        self.variables
+            .iter()
+            .filter(|v| v.scope.is_none())
+            .collect()
     }
 
     /// 変数名と PC（ファイル上の仮想アドレス）から変数を検索します。
@@ -429,8 +478,11 @@ fn collect_variables<R: gimli::Reader>(
     unit: &gimli::Unit<R>,
     variables: &mut Vec<Variable>,
 ) {
-    // (ネスト深度, スコープ範囲)
-    let mut scope_stack: Vec<(isize, (u64, u64))> = Vec::new();
+    // (ネスト深度, PC範囲の Option)
+    // None = PC範囲のない subprogram/block 内（abstract origin 等）
+    let mut scope_stack: Vec<(isize, Option<(u64, u64)>)> = Vec::new();
+    // DW_TAG_subprogram の DW_AT_frame_base スタック（lexical_block は積まない）
+    let mut fb_stack: Vec<(isize, FrameBaseDef)> = Vec::new();
     let mut depth: isize = 0;
 
     let mut entries = unit.entries();
@@ -440,27 +492,53 @@ fn collect_variables<R: gimli::Reader>(
         while scope_stack.last().map_or(false, |(d, _)| *d >= depth) {
             scope_stack.pop();
         }
+        while fb_stack.last().map_or(false, |(d, _)| *d >= depth) {
+            fb_stack.pop();
+        }
 
         match entry.tag() {
-            gimli::DW_TAG_subprogram | gimli::DW_TAG_lexical_block => {
-                if let Some(range) = entry_pc_range(entry) {
-                    scope_stack.push((depth, range));
-                }
+            gimli::DW_TAG_subprogram => {
+                // PC 範囲のない subprogram も必ずスタックに積む
+                scope_stack.push((depth, entry_pc_range(dwarf, unit, entry)));
+                fb_stack.push((depth, parse_frame_base_def(entry)));
+            }
+            gimli::DW_TAG_lexical_block => {
+                scope_stack.push((depth, entry_pc_range(dwarf, unit, entry)));
+                // frame_base は enclosing subprogram を継承するため fb_stack には積まない
             }
             gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter => {
                 let Some(name) = attr_to_string(dwarf, unit, entry, gimli::DW_AT_name) else {
                     continue;
                 };
-                let Some(location) = parse_var_location(entry) else {
+                let Some(location) = parse_var_location(dwarf, unit, entry) else {
                     continue;
                 };
                 let (byte_size, _) = resolve_type_info(dwarf, unit, entry);
-                let scope = scope_stack.last().map(|(_, r)| *r);
+                let is_arg = entry.tag() == gimli::DW_TAG_formal_parameter;
+                let frame_base = fb_stack.last().map(|(_, f)| *f).unwrap_or_default();
+
+                let scope = if scope_stack.is_empty() {
+                    // トップレベル: 真のグローバル変数
+                    None
+                } else {
+                    // 祖先の中で最も内側の PC 範囲を持つスコープを探す
+                    match scope_stack.iter().rev().find_map(|(_, r)| *r) {
+                        Some(range) => Some(range),
+                        None => {
+                            // すべての祖先が PC 範囲を持たない（abstract subprogram 等）
+                            // → 実行時に存在しない変数なのでスキップ
+                            continue;
+                        }
+                    }
+                };
+
                 variables.push(Variable {
                     name,
                     scope,
                     location,
                     byte_size,
+                    is_arg,
+                    frame_base,
                 });
             }
             _ => {}
@@ -468,12 +546,38 @@ fn collect_variables<R: gimli::Reader>(
     }
 }
 
+/// DW_TAG_subprogram の DW_AT_frame_base を解析して FrameBaseDef を返します。
+fn parse_frame_base_def<R: gimli::Reader>(
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> FrameBaseDef {
+    let Ok(Some(value)) = entry.attr_value(gimli::DW_AT_frame_base) else {
+        return FrameBaseDef::Register;
+    };
+    let first_byte = match value {
+        gimli::AttributeValue::Exprloc(expr) => {
+            expr.0.to_slice().ok().and_then(|b| b.first().copied())
+        }
+        _ => return FrameBaseDef::Register,
+    };
+    match first_byte {
+        Some(0x9c) => FrameBaseDef::CallFrameCfa, // DW_OP_call_frame_cfa
+        _ => FrameBaseDef::Register,
+    }
+}
+
 /// DIE の DW_AT_low_pc / DW_AT_high_pc から PC 範囲を取得します。
+/// DWARF 4 (DW_FORM_addr) と DWARF 5 (DW_FORM_addrx) の両方に対応します。
 fn entry_pc_range<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
 ) -> Option<(u64, u64)> {
     let low = match entry.attr_value(gimli::DW_AT_low_pc).ok()?? {
         gimli::AttributeValue::Addr(a) => a,
+        // DWARF 5: DW_FORM_addrx → .debug_addr セクションからアドレスを解決
+        gimli::AttributeValue::DebugAddrIndex(index) => {
+            dwarf.address(unit, index).ok()?
+        }
         _ => return None,
     };
     let high = match entry.attr_value(gimli::DW_AT_high_pc).ok()?? {
@@ -502,16 +606,78 @@ fn attr_to_string<R: gimli::Reader>(
 }
 
 /// DW_AT_location の DWARF 式を解析します。
-/// DW_OP_fbreg (0x91) と DW_OP_addr (0x03) のみサポートします。
+/// Exprloc・LocationListsRef (DWARF 4)・DebugLocListsIndex (DWARF 5) をサポートします。
+/// ロケーションリストでは DW_OP_fbreg エントリを DW_OP_reg* より優先して返します。
 fn parse_var_location<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
 ) -> Option<VarLocation> {
     let value = entry.attr_value(gimli::DW_AT_location).ok()??;
-    let gimli::AttributeValue::Exprloc(expr) = value else {
-        return None;
-    };
-    let bytes = expr.0.to_slice().ok()?;
-    let bytes = bytes.as_ref();
+    match value {
+        gimli::AttributeValue::Exprloc(expr) => {
+            let bytes = expr.0.to_slice().ok()?;
+            parse_location_expr(bytes.as_ref())
+        }
+        gimli::AttributeValue::LocationListsRef(offset) => {
+            // DWARF 4: .debug_loc セクションへのオフセット
+            let mut first: Option<VarLocation> = None;
+            let mut fbreg: Option<VarLocation> = None;
+            if let Ok(mut iter) = dwarf.locations.locations(
+                offset,
+                unit.encoding(),
+                unit.low_pc,
+                &dwarf.debug_addr,
+                unit.addr_base,
+            ) {
+                while let Ok(Some(e)) = iter.next() {
+                    if let Ok(bytes) = e.data.0.to_slice() {
+                        if let Some(loc) = parse_location_expr(bytes.as_ref()) {
+                            if first.is_none() {
+                                first = Some(loc);
+                            }
+                            if matches!(loc, VarLocation::FrameOffset(_)) && fbreg.is_none() {
+                                fbreg = Some(loc);
+                            }
+                        }
+                    }
+                }
+            }
+            fbreg.or(first)
+        }
+        gimli::AttributeValue::DebugLocListsIndex(index) => {
+            // DWARF 5: .debug_loclists セクションへのインデックス
+            let offset = dwarf.locations_offset(unit, index).ok()?;
+            let mut first: Option<VarLocation> = None;
+            let mut fbreg: Option<VarLocation> = None;
+            if let Ok(mut iter) = dwarf.locations.locations(
+                offset,
+                unit.encoding(),
+                unit.low_pc,
+                &dwarf.debug_addr,
+                unit.addr_base,
+            ) {
+                while let Ok(Some(e)) = iter.next() {
+                    if let Ok(bytes) = e.data.0.to_slice() {
+                        if let Some(loc) = parse_location_expr(bytes.as_ref()) {
+                            if first.is_none() {
+                                first = Some(loc);
+                            }
+                            if matches!(loc, VarLocation::FrameOffset(_)) && fbreg.is_none() {
+                                fbreg = Some(loc);
+                            }
+                        }
+                    }
+                }
+            }
+            fbreg.or(first)
+        }
+        _ => None,
+    }
+}
+
+/// DWARF ロケーション式のバイト列を解析します。
+fn parse_location_expr(bytes: &[u8]) -> Option<VarLocation> {
     match bytes.first()? {
         0x91 => {
             // DW_OP_fbreg: SLEB128 オフセット

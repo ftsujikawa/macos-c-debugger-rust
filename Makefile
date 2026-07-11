@@ -3,7 +3,7 @@ DBG_ENT      := debugger-entitlements.plist
 SAMPLE_ENT   := samples/entitlements.xml
 SAMPLES      := samples/hello samples/sleep
 CC           := clang
-CFLAGS       := -g -O0
+CFLAGS       := -g -O0 -arch arm64
 
 .PHONY: all build sign samples clean
 

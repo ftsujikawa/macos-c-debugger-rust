@@ -7,6 +7,7 @@ pub type Pid = libc::pid_t;
 pub const PT_TRACE_ME: c_int = 0;
 #[allow(dead_code)] pub const PT_READ_I: c_int = 1;
 #[allow(dead_code)] pub const PT_READ_D: c_int = 2;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const PT_WRITE_I: c_int = 4;
 #[allow(dead_code)] pub const PT_WRITE_D: c_int = 5;
 pub const PT_CONTINUE: c_int = 7;

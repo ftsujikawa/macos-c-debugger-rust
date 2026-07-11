@@ -1,7 +1,9 @@
 use std::os::raw::c_int;
 
 use crate::arch::Arch;
-use crate::ptrace::{self, Pid};
+use crate::ptrace::Pid;
+#[cfg(target_arch = "aarch64")]
+use crate::ptrace;
 use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
 use crate::register::FloatState64;

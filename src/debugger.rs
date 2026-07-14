@@ -10,6 +10,8 @@ use crate::ptrace::{self, Pid};
 use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
 use crate::register::FloatState64;
+#[cfg(target_arch = "aarch64")]
+use crate::register::ArmNeonState64;
 use crate::register::{WatchCondition, WatchLen};
 
 #[derive(Debug, Clone, Copy)]
@@ -545,6 +547,18 @@ impl Debugger {
     /// 浮動小数点レジスタを設定します (x86_64 のみ)。
     #[cfg(target_arch = "x86_64")]
     pub fn set_float_registers(&self, state: &FloatState64) -> io::Result<()> {
+        mach::set_float_registers(self.pid, state)
+    }
+
+    /// NEON/FP レジスタを取得します (ARM64 のみ)。
+    #[cfg(target_arch = "aarch64")]
+    pub fn float_registers(&self) -> io::Result<ArmNeonState64> {
+        mach::get_float_registers(self.pid)
+    }
+
+    /// NEON/FP レジスタを設定します (ARM64 のみ)。
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_float_registers(&self, state: &ArmNeonState64) -> io::Result<()> {
         mach::set_float_registers(self.pid, state)
     }
 

@@ -8,7 +8,7 @@ use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
 use crate::register::{FloatState64, X86DebugState64, WatchCondition, WatchLen, dr7_set_slot, dr7_clear_slot};
 #[cfg(target_arch = "aarch64")]
-use crate::register::{ArmDebugState64, HW_BP_BCR_ENABLE, WatchCondition, WatchLen, wcr_encode};
+use crate::register::{ArmDebugState64, ArmNeonState64, HW_BP_BCR_ENABLE, WatchCondition, WatchLen, wcr_encode};
 
 pub type MachPort = u32;
 pub type KernReturn = c_int;
@@ -31,6 +31,10 @@ const THREAD_STATE64_FLAVOR: i32 = 6; // ARM_THREAD_STATE64
 const ARM_DEBUG_STATE64_FLAVOR: i32 = 15; // ARM_DEBUG_STATE64
 #[cfg(target_arch = "aarch64")]
 const ARM_DEBUG_STATE64_COUNT: u32 = 130; // 520 bytes / 4 (bvr[16]+bcr[16]+wvr[16]+wcr[16]+mdscr_el1)
+#[cfg(target_arch = "aarch64")]
+const ARM_NEON_STATE64_FLAVOR: i32 = 17; // ARM_NEON_STATE64
+#[cfg(target_arch = "aarch64")]
+const ARM_NEON_STATE64_COUNT: u32 = (std::mem::size_of::<ArmNeonState64>() / 4) as u32;
 
 #[allow(dead_code)]
 const VM_PROT_NONE: i32 = 0x00;
@@ -212,6 +216,47 @@ pub fn set_float_registers(pid: Pid, state: &FloatState64) -> std::io::Result<()
         let _ = mach_port_deallocate(task_self(), thread);
         let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_set_state (float)")?;
+        Ok(())
+    }
+}
+
+/// NEON/FP レジスタ状態を取得します (ARM64 のみ)。
+#[cfg(target_arch = "aarch64")]
+pub fn get_float_registers(pid: Pid) -> std::io::Result<ArmNeonState64> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let mut state = ArmNeonState64::default();
+        let mut count = ARM_NEON_STATE64_COUNT;
+        let ret = thread_get_state(
+            thread,
+            ARM_NEON_STATE64_FLAVOR,
+            &mut state as *mut ArmNeonState64 as *mut u32,
+            &mut count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        mach_err(ret, "thread_get_state (neon)")?;
+        Ok(state)
+    }
+}
+
+/// NEON/FP レジスタ状態を設定します (ARM64 のみ)。
+#[cfg(target_arch = "aarch64")]
+pub fn set_float_registers(pid: Pid, state: &ArmNeonState64) -> std::io::Result<()> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let count = ARM_NEON_STATE64_COUNT;
+        let ret = thread_set_state(
+            thread,
+            ARM_NEON_STATE64_FLAVOR,
+            state as *const ArmNeonState64 as *const u32,
+            count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        mach_err(ret, "thread_set_state (neon)")?;
         Ok(())
     }
 }

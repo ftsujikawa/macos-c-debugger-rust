@@ -335,6 +335,91 @@ impl FloatState64 {
     }
 }
 
+/// ARM64 NEON/FP レジスタ状態 (ARM_NEON_STATE64)。
+/// V0-V31 (128ビット) と FPSR/FPCR を保持します。
+/// V レジスタは Q (128bit) / D (64bit) / S (32bit) / H (16bit) / B (8bit) で
+/// 下位ビットをエイリアスします。
+/// C 側は `__uint128_t v[32]` (16バイトアライン) を持つため、
+/// 構造体全体のサイズも 16 の倍数にパディングされる (520→528 バイト)。
+/// これが ARM_NEON_STATE64_COUNT の計算に影響するため align(16) で揃える。
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Debug)]
+pub struct ArmNeonState64 {
+    pub v: [[u8; 16]; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Default for ArmNeonState64 {
+    fn default() -> Self {
+        // Safety: 全フィールドが数値型 or バイト配列なのでゼロ初期化で有効
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl ArmNeonState64 {
+    /// レジスタ名に値を設定します。
+    /// v/q: 下位 64 ビットに書き込み、上位 64 ビットはゼロにします。
+    /// d/s/h/b: 該当バイト幅のみ書き込みます (残りは変更しません)。
+    pub fn set(&mut self, name: &str, value: u64) -> Option<()> {
+        let name = name.to_lowercase();
+        let bytes = value.to_le_bytes();
+
+        let (prefix, rest) = if let Some(r) = name.strip_prefix('v') {
+            ('v', r)
+        } else if let Some(r) = name.strip_prefix('q') {
+            ('q', r)
+        } else if let Some(r) = name.strip_prefix('d') {
+            ('d', r)
+        } else if let Some(r) = name.strip_prefix('s') {
+            ('s', r)
+        } else if let Some(r) = name.strip_prefix('h') {
+            ('h', r)
+        } else if let Some(r) = name.strip_prefix('b') {
+            ('b', r)
+        } else {
+            return match name.as_str() {
+                "fpsr" => { self.fpsr = value as u32; Some(()) }
+                "fpcr" => { self.fpcr = value as u32; Some(()) }
+                _ => None,
+            };
+        };
+        let n: usize = rest.parse().ok()?;
+        if n >= 32 {
+            return None;
+        }
+        match prefix {
+            'v' | 'q' => {
+                self.v[n][..8].copy_from_slice(&bytes);
+                self.v[n][8..].fill(0);
+            }
+            'd' => self.v[n][..8].copy_from_slice(&bytes),
+            's' => self.v[n][..4].copy_from_slice(&bytes[..4]),
+            'h' => self.v[n][..2].copy_from_slice(&bytes[..2]),
+            'b' => self.v[n][..1].copy_from_slice(&bytes[..1]),
+            _ => unreachable!(),
+        }
+        Some(())
+    }
+
+    /// V0-V31 / FPSR / FPCR を表示します。
+    pub fn display(&self) {
+        println!("  FPSR: {:#010x}  FPCR: {:#010x}", self.fpsr, self.fpcr);
+        for i in 0..32 {
+            let reg = &self.v[i];
+            let lo = u64::from_le_bytes(reg[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(reg[8..16].try_into().unwrap());
+            print!(" V{i:02}: {hi:016x}_{lo:016x}");
+            if (i + 1) % 2 == 0 {
+                println!();
+            }
+        }
+    }
+}
+
 /// ARM64 デバッグ状態 (ARM_DEBUG_STATE64)
 /// ハードウェアブレークポイント / ウォッチポイントレジスタを保持する。
 ///

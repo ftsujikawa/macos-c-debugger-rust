@@ -1142,7 +1142,6 @@ fn main() -> io::Result<()> {
                     Ok(regs) => regs.display(),
                     Err(e) => eprintln!("failed to read registers: {}", e),
                 }
-                #[cfg(target_arch = "x86_64")]
                 match dbg.float_registers() {
                     Ok(fregs) => fregs.display(),
                     Err(e) => eprintln!("failed to read float registers: {}", e),
@@ -1284,8 +1283,7 @@ fn main() -> io::Result<()> {
                     }
                 }
 
-                // 汎用レジスタで見つからなければ浮動小数点レジスタを試みる (x86_64)
-                #[cfg(target_arch = "x86_64")]
+                // 汎用レジスタで見つからなければ浮動小数点レジスタを試みる
                 if !tried_as_reg {
                     if let Some(reg) = reg_name {
                         match dbg.float_registers() {

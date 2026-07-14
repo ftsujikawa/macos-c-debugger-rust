@@ -8,7 +8,7 @@ use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
 use crate::register::{FloatState64, X86DebugState64, WatchCondition, WatchLen, dr7_set_slot, dr7_clear_slot};
 #[cfg(target_arch = "aarch64")]
-use crate::register::{ArmDebugState64, HW_BP_BCR_ENABLE};
+use crate::register::{ArmDebugState64, HW_BP_BCR_ENABLE, WatchCondition, WatchLen, wcr_encode};
 
 pub type MachPort = u32;
 pub type KernReturn = c_int;
@@ -294,6 +294,34 @@ pub fn clear_hw_breakpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
     let mut state = get_debug_state(pid)?;
     state.bvr[slot] = 0;
     state.bcr[slot] = 0;
+    set_debug_state(pid, &state)
+}
+
+/// 指定スロットにハードウェアウォッチポイントを設定します。
+/// slot は 0..4 の範囲。
+#[cfg(target_arch = "aarch64")]
+pub fn set_hw_watchpoint_slot(
+    pid: Pid,
+    slot: usize,
+    addr: usize,
+    cond: WatchCondition,
+    len: WatchLen,
+) -> std::io::Result<()> {
+    assert!(slot < 4, "HW watchpoint slot must be 0..3");
+    let mut state = get_debug_state(pid)?;
+    let (wvr, wcr) = wcr_encode(addr, cond, len);
+    state.wvr[slot] = wvr;
+    state.wcr[slot] = wcr;
+    set_debug_state(pid, &state)
+}
+
+/// 指定スロットのハードウェアウォッチポイントをクリアします。
+#[cfg(target_arch = "aarch64")]
+pub fn clear_hw_watchpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
+    assert!(slot < 4, "HW watchpoint slot must be 0..3");
+    let mut state = get_debug_state(pid)?;
+    state.wvr[slot] = 0;
+    state.wcr[slot] = 0;
     set_debug_state(pid, &state)
 }
 

@@ -16,7 +16,6 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use debugger::{Debugger, WaitStatus};
-#[cfg(target_arch = "x86_64")]
 use register::{WatchCondition, WatchLen};
 use leak_tracker::{LeakTracker, auto_cont};
 use symbols::{FrameBaseDef, Symbols, Variable, VarLocation};
@@ -930,14 +929,11 @@ fn main() -> io::Result<()> {
                         println!("Software watchpoint #{} deleted.", n);
                         continue;
                     }
-                    // ハードウェアウォッチポイント (x86_64)
-                    #[cfg(target_arch = "x86_64")]
+                    // ハードウェアウォッチポイント
                     match dbg.remove_watchpoint_slot(n) {
                         Ok(()) => println!("Hardware watchpoint #{} deleted.", n),
                         Err(e) => eprintln!("del watch: {}", e),
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    eprintln!("del watch: watchpoint #{} not found", n);
                     continue;
                 }
                 if parts[1] == "all" {
@@ -975,7 +971,6 @@ fn main() -> io::Result<()> {
             // awatch <addr> [size]      読み書きウォッチポイント (rwatch の別名)
             // del watch <N>             ウォッチポイント削除
             // show watch                ウォッチポイント一覧
-            #[cfg(target_arch = "x86_64")]
             "watch" | "rwatch" | "awatch" => {
                 if parts.len() < 2 {
                     eprintln!("usage: {} <addr|expr> [size]  (size: 1/2/4/8, default 4)", parts[0]);
@@ -1058,7 +1053,6 @@ fn main() -> io::Result<()> {
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
-                #[cfg(target_arch = "x86_64")]
                 if let Some(wp_addr) = dbg.at_watchpoint() {
                     println!("Hardware watchpoint hit at {:#018x}", wp_addr);
                 }
@@ -1374,22 +1368,19 @@ fn main() -> io::Result<()> {
             "show" => {
                 if parts.get(1) == Some(&"watch") {
                     let mut any = false;
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let wps = dbg.watchpoint_slots();
-                        for (slot, info) in &wps {
-                            any = true;
-                            let cond_str = match info.cond {
-                                WatchCondition::Write     => "write",
-                                WatchCondition::ReadWrite => "read/write",
-                                WatchCondition::Execute   => "execute",
-                                WatchCondition::IoRW      => "io-rw",
-                            };
-                            println!(
-                                "HW WP#{} {:#018x}  {} byte(s)  {}",
-                                slot, info.addr, info.len.as_bytes(), cond_str
-                            );
-                        }
+                    let wps = dbg.watchpoint_slots();
+                    for (slot, info) in &wps {
+                        any = true;
+                        let cond_str = match info.cond {
+                            WatchCondition::Write     => "write",
+                            WatchCondition::ReadWrite => "read/write",
+                            WatchCondition::Execute   => "execute",
+                            WatchCondition::IoRW      => "io-rw",
+                        };
+                        println!(
+                            "HW WP#{} {:#018x}  {} byte(s)  {}",
+                            slot, info.addr, info.len.as_bytes(), cond_str
+                        );
                     }
                     for wp in &soft_watches {
                         any = true;

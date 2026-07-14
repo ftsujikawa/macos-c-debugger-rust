@@ -9,7 +9,8 @@ use crate::mach;
 use crate::ptrace::{self, Pid};
 use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
-use crate::register::{FloatState64, WatchCondition, WatchLen};
+use crate::register::FloatState64;
+use crate::register::{WatchCondition, WatchLen};
 
 #[derive(Debug, Clone, Copy)]
 pub enum WaitStatus {
@@ -29,6 +30,18 @@ pub struct WatchpointInfo {
     pub len: WatchLen,
 }
 
+/// ウォッチポイント情報 (ARM64)
+/// ARM64 には DR6 相当のヒットスロット通知がないため、
+/// ヒット判定用に前回読み取った値を保持します。
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug)]
+pub struct WatchpointInfo {
+    pub addr: usize,
+    pub cond: WatchCondition,
+    pub len: WatchLen,
+    pub prev_value: Vec<u8>,
+}
+
 pub struct Debugger {
     pub pid: Pid,
     _child: Child,
@@ -41,11 +54,11 @@ pub struct Debugger {
     /// ARM64 HW BP スロット管理 (slot → addr)
     #[cfg(target_arch = "aarch64")]
     hw_bp_slots: [Option<usize>; 16],
-    /// x86_64 ウォッチポイントスロット管理 (slot 0〜3 → info)
-    #[cfg(target_arch = "x86_64")]
+    /// ウォッチポイントスロット管理 (slot 0〜3 → info)
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     wp_slots: [Option<WatchpointInfo>; 4],
     /// 直前の停止がウォッチポイントヒットかどうか
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     at_watchpoint: Option<usize>, // ヒットしたアドレス
 }
 
@@ -73,9 +86,9 @@ impl Debugger {
             arch: Arch::X86_64, // 仮初期値、exec 停止後に上書き
             #[cfg(target_arch = "aarch64")]
             hw_bp_slots: [None; 16],
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wp_slots: [const { None }; 4],
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             at_watchpoint: None,
         };
 
@@ -119,7 +132,6 @@ impl Debugger {
         let status = self.wait()?;
         self.last_status = Some(status);
         self.handle_breakpoint_hit()?;
-        #[cfg(target_arch = "x86_64")]
         self.handle_watchpoint_hit()?;
         Ok(self.last_status.unwrap())
     }
@@ -434,6 +446,64 @@ impl Debugger {
         self.at_watchpoint
     }
 
+    /// ウォッチポイントを設定します (ARM64 のみ、スロット 0〜3、WVR/WCR ベース)。
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_watchpoint(
+        &mut self,
+        addr: usize,
+        cond: WatchCondition,
+        len: WatchLen,
+    ) -> io::Result<usize> {
+        // 同じアドレスが既に登録されていればそのスロットを返す
+        for (slot, entry) in self.wp_slots.iter().enumerate() {
+            if entry.as_ref().map_or(false, |e| e.addr == addr) {
+                return Ok(slot);
+            }
+        }
+        // 空きスロットを探す
+        let slot = self
+            .wp_slots
+            .iter()
+            .position(|e| e.is_none())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "watchpoint slots exhausted (max 4 on ARM64)",
+                )
+            })?;
+        let prev = self.read_memory(addr, len.as_bytes()).unwrap_or_default();
+        mach::set_hw_watchpoint_slot(self.pid, slot, addr, cond, len)?;
+        self.wp_slots[slot] = Some(WatchpointInfo { addr, cond, len, prev_value: prev });
+        Ok(slot)
+    }
+
+    /// ウォッチポイントをスロット番号で削除します (ARM64 のみ)。
+    #[cfg(target_arch = "aarch64")]
+    pub fn remove_watchpoint_slot(&mut self, slot: usize) -> io::Result<()> {
+        if slot >= 4 {
+            return Err(io::Error::new(io::ErrorKind::Other, "invalid watchpoint slot"));
+        }
+        mach::clear_hw_watchpoint_slot(self.pid, slot)?;
+        self.wp_slots[slot] = None;
+        Ok(())
+    }
+
+    /// 設定済みウォッチポイントの一覧を返します (slot, info) (ARM64 のみ)。
+    #[cfg(target_arch = "aarch64")]
+    pub fn watchpoint_slots(&self) -> Vec<(usize, &WatchpointInfo)> {
+        self.wp_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|info| (i, info)))
+            .collect()
+    }
+
+    /// 直前の停止がウォッチポイントヒットかどうか (ARM64 のみ)。
+    #[cfg(target_arch = "aarch64")]
+    pub fn at_watchpoint(&self) -> Option<usize> {
+        self.at_watchpoint
+    }
+
     /// ブレークポイントを削除します。
     pub fn remove_breakpoint(&mut self, addr: usize) -> io::Result<()> {
         #[cfg(target_arch = "aarch64")]
@@ -596,6 +666,42 @@ impl Debugger {
                 if let Some(info) = &self.wp_slots[slot] {
                     self.at_watchpoint = Some(info.addr);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// ウォッチポイントヒットを記録します (ARM64 のみ)。
+    /// ARM64 には DR6 相当のヒットスロット通知 (ESR_EL1) がユーザ空間 (ptrace) から
+    /// 取得できないため、各スロットの監視先メモリを前回値と比較して変化した
+    /// スロットをヒットとみなします。
+    #[cfg(target_arch = "aarch64")]
+    fn handle_watchpoint_hit(&mut self) -> io::Result<()> {
+        self.at_watchpoint = None;
+        if let Some(WaitStatus::Stopped { signal, .. }) = self.last_status {
+            // ウォッチポイントも SIGTRAP で停止する
+            if signal != libc::SIGTRAP {
+                return Ok(());
+            }
+            // ブレークポイントヒットでない場合のみウォッチポイントを確認
+            if self.at_breakpoint.is_some() {
+                return Ok(());
+            }
+            for slot in 0..self.wp_slots.len() {
+                let Some(info) = self.wp_slots[slot].clone() else { continue };
+                let cur = self.read_memory(info.addr, info.len.as_bytes()).unwrap_or_default();
+                if cur != info.prev_value {
+                    self.at_watchpoint = Some(info.addr);
+                    if let Some(entry) = self.wp_slots[slot].as_mut() {
+                        entry.prev_value = cur;
+                    }
+                    return Ok(());
+                }
+            }
+            // 値が変化していなくても HW ウォッチポイントが設定済みなら、
+            // その SIGTRAP はウォッチポイント由来とみなす (取りこぼし防止)
+            if let Some(info) = self.wp_slots.iter().flatten().next() {
+                self.at_watchpoint = Some(info.addr);
             }
         }
         Ok(())

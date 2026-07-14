@@ -361,6 +361,29 @@ pub struct ArmDebugState64 {
 #[cfg(target_arch = "aarch64")]
 pub const HW_BP_BCR_ENABLE: u64 = 0x1E5;
 
+/// ARM64 ウォッチポイント用 WVR (監視アドレス) と WCR (制御値) を組み立てます。
+///
+/// AArch64 デバッグアーキテクチャ:
+///   WVR.VA bits[63:3] = ウォッチアドレス (8バイト境界にアライン、下位3ビットは RES0)
+///   WCR: E bit[0]=1(有効), PAC bits[2:1]=10(EL0のみ), LSC bits[4:3]=Load/Store制御,
+///        BAS bits[12:5]=アライン済みアドレスからのバイトマスク
+#[cfg(target_arch = "aarch64")]
+pub fn wcr_encode(addr: usize, cond: WatchCondition, len: WatchLen) -> (u64, u64) {
+    let size = len.as_bytes();
+    let offset = addr & 0x7;
+    let bas: u64 = (((1u64 << size) - 1) << offset) & 0xff;
+    let lsc: u64 = match cond {
+        WatchCondition::Write => 0b10,
+        _ => 0b11, // ReadWrite など (Load/Store 両方)
+    };
+    let wcr = 1u64            // E: 有効
+        | (0b10u64 << 1)      // PAC: EL0 のみ
+        | (lsc << 3)          // LSC
+        | (bas << 5);         // BAS
+    let wvr = (addr as u64) & !0x7;
+    (wvr, wcr)
+}
+
 /// x86_64 デバッグ状態 (x86_DEBUG_STATE64, flavor = 12)
 /// DR0〜DR3 がウォッチポイント / ブレークポイントアドレス。
 /// DR6 = ステータス、DR7 = 制御。
@@ -412,8 +435,7 @@ pub fn dr7_clear_slot(dr7: u64, slot: usize) -> u64 {
     dr7 & !mask
 }
 
-/// ウォッチポイントのトリガー条件 (DR7 R/W フィールド)
-#[cfg(target_arch = "x86_64")]
+/// ウォッチポイントのトリガー条件 (x86_64: DR7 R/W フィールド、ARM64: WCR LSC フィールド)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchCondition {
     /// 実行 (ブレークポイント)
@@ -421,15 +443,14 @@ pub enum WatchCondition {
     Execute = 0b00,
     /// 書き込み
     Write    = 0b01,
-    /// 読み書き（I/O アドレス空間）
+    /// 読み書き（I/O アドレス空間、x86_64 のみ）
     #[allow(dead_code)]
     IoRW     = 0b10,
     /// 読み書き（データアドレス空間）
     ReadWrite = 0b11,
 }
 
-/// ウォッチポイントの監視バイト幅 (DR7 LEN フィールド)
-#[cfg(target_arch = "x86_64")]
+/// ウォッチポイントの監視バイト幅 (x86_64: DR7 LEN フィールド、ARM64: WCR BAS 幅)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchLen {
     Byte1  = 0b00,
@@ -438,7 +459,6 @@ pub enum WatchLen {
     Dword4 = 0b11,
 }
 
-#[cfg(target_arch = "x86_64")]
 impl WatchLen {
     pub fn from_bytes(n: usize) -> Self {
         match n {

@@ -6,7 +6,7 @@ use crate::ptrace::Pid;
 use crate::ptrace;
 use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
-use crate::register::FloatState64;
+use crate::register::{FloatState64, X86DebugState64, WatchCondition, WatchLen, dr7_set_slot, dr7_clear_slot};
 #[cfg(target_arch = "aarch64")]
 use crate::register::{ArmDebugState64, HW_BP_BCR_ENABLE};
 
@@ -19,6 +19,11 @@ const THREAD_STATE64_FLAVOR: i32 = 4; // x86_THREAD_STATE64
 const FLOAT_STATE64_FLAVOR: i32 = 5; // x86_FLOAT_STATE64
 #[cfg(target_arch = "x86_64")]
 const FLOAT_STATE64_COUNT: u32 = 131; // x86_FLOAT_STATE64_COUNT (524 bytes / 4)
+#[cfg(target_arch = "x86_64")]
+const DEBUG_STATE64_FLAVOR: i32 = 12; // x86_DEBUG_STATE64
+// x86_DEBUG_STATE64_COUNT = sizeof(x86_debug_state64_t) / sizeof(int) = 64 / 4 = 16
+#[cfg(target_arch = "x86_64")]
+const DEBUG_STATE64_COUNT: u32 = (std::mem::size_of::<crate::register::X86DebugState64>() / 4) as u32;
 
 #[cfg(target_arch = "aarch64")]
 const THREAD_STATE64_FLAVOR: i32 = 6; // ARM_THREAD_STATE64
@@ -513,6 +518,116 @@ pub fn detect_arch(pid: Pid) -> std::io::Result<Arch> {
             format!("unknown cpu_type in Mach-O header: {:#010x}", cpu_type),
         )),
     }
+}
+
+/// x86_64 デバッグレジスタ状態を取得します。
+#[cfg(target_arch = "x86_64")]
+pub fn get_debug_state(pid: Pid) -> std::io::Result<X86DebugState64> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let mut state = X86DebugState64::default();
+        let mut count = DEBUG_STATE64_COUNT;
+        let ret = thread_get_state(
+            thread,
+            DEBUG_STATE64_FLAVOR,
+            &mut state as *mut X86DebugState64 as *mut u32,
+            &mut count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        if ret != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "thread_get_state (x86_DEBUG_STATE64): mach error {} \
+                     — デバッグレジスタへのアクセスには cs.debugger エンタイトルメントが必要です。\
+                     `make sign` を実行してデバッガーに署名してください。\
+                     Apple Silicon + Rosetta 2 環境では x86 デバッグレジスタは使用できません。",
+                    ret
+                ),
+            ));
+        }
+        Ok(state)
+    }
+}
+
+/// x86_64 デバッグレジスタ状態を設定します。
+#[cfg(target_arch = "x86_64")]
+pub fn set_debug_state(pid: Pid, state: &X86DebugState64) -> std::io::Result<()> {
+    let task = get_task(pid)?;
+    unsafe {
+        let thread = get_main_thread(task)?;
+        let count = DEBUG_STATE64_COUNT;
+        let ret = thread_set_state(
+            thread,
+            DEBUG_STATE64_FLAVOR,
+            state as *const X86DebugState64 as *const u32,
+            count,
+        );
+        let _ = mach_port_deallocate(task_self(), thread);
+        let _ = mach_port_deallocate(task_self(), task);
+        mach_err(ret, "thread_set_state (debug)")?;
+        Ok(())
+    }
+}
+
+/// 指定スロット (0〜3) にウォッチポイントを設定します。
+#[cfg(target_arch = "x86_64")]
+pub fn set_watchpoint_slot(
+    pid: Pid,
+    slot: usize,
+    addr: usize,
+    cond: WatchCondition,
+    len: WatchLen,
+) -> std::io::Result<()> {
+    assert!(slot < 4, "watchpoint slot must be 0..3");
+    let mut state = get_debug_state(pid)?;
+    // DRn にアドレスを設定
+    match slot {
+        0 => state.__dr0 = addr as u64,
+        1 => state.__dr1 = addr as u64,
+        2 => state.__dr2 = addr as u64,
+        3 => state.__dr3 = addr as u64,
+        _ => unreachable!(),
+    }
+    state.__dr7 = dr7_set_slot(state.__dr7, slot, cond, len);
+    set_debug_state(pid, &state)
+}
+
+/// 指定スロットのウォッチポイントをクリアします。
+#[cfg(target_arch = "x86_64")]
+pub fn clear_watchpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
+    assert!(slot < 4, "watchpoint slot must be 0..3");
+    let mut state = get_debug_state(pid)?;
+    match slot {
+        0 => state.__dr0 = 0,
+        1 => state.__dr1 = 0,
+        2 => state.__dr2 = 0,
+        3 => state.__dr3 = 0,
+        _ => unreachable!(),
+    }
+    state.__dr7 = dr7_clear_slot(state.__dr7, slot);
+    set_debug_state(pid, &state)
+}
+
+/// ヒットしたウォッチポイントスロット番号を DR6 から読み取ります。
+/// 戻り値: ヒットしたスロット番号のリスト (0〜3)
+#[cfg(target_arch = "x86_64")]
+pub fn watchpoint_hit_slots(pid: Pid) -> std::io::Result<Vec<usize>> {
+    let state = get_debug_state(pid)?;
+    let dr6 = state.__dr6;
+    let mut hits = Vec::new();
+    for slot in 0..4 {
+        if dr6 & (1u64 << slot) != 0 {
+            hits.push(slot);
+        }
+    }
+    // DR6 をクリア（次回判定のため）
+    let mut cleared = state;
+    cleared.__dr6 = 0;
+    let _ = set_debug_state(pid, &cleared);
+    Ok(hits)
 }
 
 #[cfg(test)]

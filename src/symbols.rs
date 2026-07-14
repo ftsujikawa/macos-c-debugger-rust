@@ -27,6 +27,8 @@ pub struct Symbols {
     variables: Vec<Variable>,
     /// 外部関数スタブの静的アドレス (シンボル名 → static vaddr)
     stubs: HashMap<String, u64>,
+    /// 構造体/共用体型情報 (型名 → StructInfo)
+    structs: HashMap<String, StructInfo>,
 }
 
 /// DW_AT_frame_base の種類。DW_OP_fbreg のオフセット基準を決定します。
@@ -39,6 +41,32 @@ pub enum FrameBaseDef {
     /// x86_64: CFA = rbp + 16
     /// aarch64: CFA = fp + frame_size (プロローグ命令から判定)
     CallFrameCfa,
+}
+
+/// 構造体/共用体の 1 フィールド情報。
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FieldInfo {
+    /// メンバ名
+    pub name: String,
+    /// 構造体先頭からのバイトオフセット
+    pub offset: u64,
+    /// フィールドのバイト幅
+    pub byte_size: u8,
+    /// フィールドの型名（ポインタなら "ptr"）
+    pub type_name: String,
+    /// ポインタ型かどうか
+    pub is_pointer: bool,
+    /// ポインタが指す型の名前
+    pub pointee_type: String,
+}
+
+/// 構造体/共用体の型情報。キーは型名 ("Point" 等、struct プレフィックスなし)。
+#[derive(Debug, Clone)]
+pub struct StructInfo {
+    #[allow(dead_code)]
+    pub byte_size: u64,
+    pub fields: Vec<FieldInfo>,
 }
 
 /// DWARF から読み取った変数 1 つ分の情報。
@@ -56,6 +84,12 @@ pub struct Variable {
     pub is_arg: bool,
     /// DW_OP_fbreg のオフセット基準
     pub frame_base: FrameBaseDef,
+    /// 型名（"int", "Point", "Point*" 等）
+    pub type_name: String,
+    /// ポインタ型かどうか
+    pub is_pointer: bool,
+    /// ポインタが指す型の名前
+    pub pointee_type: String,
 }
 
 /// 変数の場所。
@@ -91,7 +125,7 @@ impl Symbols {
 
         // デバッグ情報 (DWARF) を読み込み。dSYM があれば優先。
         let debug_file = find_debug_file(exe);
-        let (line_rows, comp_dirs, type_names, variables) =
+        let (line_rows, comp_dirs, type_names, variables, structs) =
             load_line_rows(&debug_file).unwrap_or_default();
 
         // malloc/free などの外部スタブアドレスを Mach-O から取得
@@ -109,6 +143,7 @@ impl Symbols {
             type_names,
             variables,
             stubs,
+            structs,
         })
     }
 
@@ -188,6 +223,11 @@ impl Symbols {
     /// 実行時のロードアドレスからスライド量を計算します。
     pub fn slide(&self, runtime_base: u64) -> u64 {
         runtime_base.wrapping_sub(self.text_vmaddr)
+    }
+
+    /// 型名から構造体情報を返します。
+    pub fn find_struct(&self, type_name: &str) -> Option<&StructInfo> {
+        self.structs.get(type_name)
     }
 
     /// 外部関数スタブの実行時アドレスを返します。
@@ -393,6 +433,7 @@ type DebugInfo = (
     BTreeSet<String>,
     BTreeSet<String>,
     Vec<Variable>,
+    HashMap<String, StructInfo>,
 );
 
 fn load_line_rows(debug_file: &Path) -> Option<DebugInfo> {
@@ -486,7 +527,15 @@ fn load_line_rows(debug_file: &Path) -> Option<DebugInfo> {
             });
         }
     }
-    Some((result, comp_dirs, type_names, variables))
+    let mut structs = HashMap::new();
+    // 構造体情報は全ユニットを再走査して収集
+    let mut units2 = dwarf.units();
+    while let Ok(Some(header)) = units2.next() {
+        let unit = match dwarf.unit(header) { Ok(u) => u, Err(_) => continue };
+        collect_struct_info(&dwarf, &unit, &mut structs);
+    }
+
+    Some((result, comp_dirs, type_names, variables, structs))
 }
 
 /// ユニットの DIE から変数情報を収集します。
@@ -531,7 +580,8 @@ fn collect_variables<R: gimli::Reader>(
                 let Some(location) = parse_var_location(dwarf, unit, entry) else {
                     continue;
                 };
-                let (byte_size, _) = resolve_type_info(dwarf, unit, entry);
+                let (byte_size, type_name, is_pointer, pointee_type) =
+                    resolve_type_info_full(dwarf, unit, entry);
                 let is_arg = entry.tag() == gimli::DW_TAG_formal_parameter;
                 let frame_base = fb_stack.last().map(|(_, f)| *f).unwrap_or_default();
 
@@ -557,6 +607,9 @@ fn collect_variables<R: gimli::Reader>(
                     byte_size,
                     is_arg,
                     frame_base,
+                    type_name,
+                    is_pointer,
+                    pointee_type,
                 });
             }
             _ => {}
@@ -738,40 +791,121 @@ fn decode_sleb128(bytes: &[u8]) -> Option<(i64, usize)> {
 
 /// DW_AT_type をたどって型のバイト数と型名を取得します。
 /// typedef などを最大 8 回まで追跡します。不明な場合は (8, "") を返します。
+#[allow(dead_code)]
 fn resolve_type_info<R: gimli::Reader>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
 ) -> (u8, String) {
+    let (sz, name, _, _) = resolve_type_info_full(dwarf, unit, entry);
+    (sz, name)
+}
+
+/// DW_AT_type をたどって (バイト数, 型名, is_pointer, pointee_type_name) を返します。
+fn resolve_type_info_full<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> (u8, String, bool, String) {
     let mut type_name = String::new();
     let mut offset = match entry.attr_value(gimli::DW_AT_type) {
         Ok(Some(gimli::AttributeValue::UnitRef(o))) => o,
-        _ => return (8, type_name),
+        _ => return (8, type_name, false, String::new()),
     };
-    for _ in 0..8 {
-        let Ok(die) = unit.entry(offset) else {
-            break;
-        };
+    for _ in 0..16 {
+        let Ok(die) = unit.entry(offset) else { break };
+        let is_ptr = die.tag() == gimli::DW_TAG_pointer_type;
         if type_name.is_empty() {
             if let Some(name) = attr_to_string(dwarf, unit, &die, gimli::DW_AT_name) {
                 type_name = name;
             }
         }
+        if is_ptr {
+            // ポインタの場合は pointee 型名を解決
+            let pointee = match die.attr_value(gimli::DW_AT_type) {
+                Ok(Some(gimli::AttributeValue::UnitRef(po))) => {
+                    unit.entry(po).ok().and_then(|pdie| {
+                        attr_to_string(dwarf, unit, &pdie, gimli::DW_AT_name)
+                    }).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            if type_name.is_empty() { type_name = format!("{}*", pointee); }
+            return (8, type_name, true, pointee);
+        }
         if let Ok(Some(gimli::AttributeValue::Udata(size))) =
             die.attr_value(gimli::DW_AT_byte_size)
         {
-            return (size.min(8) as u8, type_name);
-        }
-        // ポインタ型は 8 バイト
-        if die.tag() == gimli::DW_TAG_pointer_type {
-            return (8, type_name);
+            return (size.min(8) as u8, type_name, false, String::new());
         }
         match die.attr_value(gimli::DW_AT_type) {
             Ok(Some(gimli::AttributeValue::UnitRef(o))) => offset = o,
             _ => break,
         }
     }
-    (8, type_name)
+    (8, type_name, false, String::new())
+}
+
+/// 構造体/共用体の型情報を収集します。
+fn collect_struct_info<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    structs: &mut HashMap<String, StructInfo>,
+) {
+    let mut cursor = unit.entries();
+    // (tag, name, byte_size) でブロックの開始を認識
+    while let Ok(Some((delta, entry))) = cursor.next_dfs() {
+        let _ = delta;
+        if !matches!(
+            entry.tag(),
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type
+        ) {
+            continue;
+        }
+        let type_name = match attr_to_string(dwarf, unit, entry, gimli::DW_AT_name) {
+            Some(n) => n,
+            None => continue,
+        };
+        let byte_size = match entry.attr_value(gimli::DW_AT_byte_size) {
+            Ok(Some(gimli::AttributeValue::Udata(s))) => s,
+            _ => continue,
+        };
+
+        // メンバを収集: entry の子 DIE を走査
+        let mut fields = Vec::new();
+        let mut children = unit.entries_at_offset(entry.offset()).ok().map(|mut c| {
+            let _ = c.next_dfs(); // 自身をスキップ
+            c
+        });
+        if let Some(ref mut children_cursor) = children {
+            let mut depth = 0isize;
+            while let Ok(Some((d, child))) = children_cursor.next_dfs() {
+                depth += d;
+                if depth <= 0 { break; } // 構造体スコープを抜けた
+                if child.tag() != gimli::DW_TAG_member { continue; }
+                let fname = match attr_to_string(dwarf, unit, child, gimli::DW_AT_name) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let offset_bytes = match child.attr_value(gimli::DW_AT_data_member_location) {
+                    Ok(Some(gimli::AttributeValue::Udata(o))) => o,
+                    Ok(Some(gimli::AttributeValue::Sdata(o))) => o as u64,
+                    _ => 0,
+                };
+                let (fsize, fname_type, is_ptr, pointee) =
+                    resolve_type_info_full(dwarf, unit, child);
+                fields.push(FieldInfo {
+                    name: fname,
+                    offset: offset_bytes,
+                    byte_size: fsize,
+                    type_name: fname_type,
+                    is_pointer: is_ptr,
+                    pointee_type: pointee,
+                });
+            }
+        }
+        structs.entry(type_name).or_insert(StructInfo { byte_size, fields });
+    }
 }
 
 /// ユニットの DIE から型名を収集します。

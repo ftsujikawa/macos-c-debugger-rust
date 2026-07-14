@@ -18,6 +18,8 @@ enum Token {
     Shl,
     Shr,
     Not,
+    Dot,     // .
+    Arrow,   // ->
     LParen,
     RParen,
     End,
@@ -38,6 +40,7 @@ pub enum Op {
     Not,
     Neg,
     Deref,
+    AddrOf,
 }
 
 #[derive(Debug, Clone)]
@@ -47,29 +50,41 @@ pub enum Expr {
     Variable(String),
     Unary(Op, Box<Expr>),
     Binary(Op, Box<Expr>, Box<Expr>),
+    /// expr.field
+    Member(Box<Expr>, String),
+    /// expr->field  (pointer member access)
+    PtrMember(Box<Expr>, String),
 }
 
 /// 式の評価に必要なコンテキストを保持します。
-/// `read_mem` が指定されていれば、`*addr` のメモリ参照が可能です。
 pub struct EvalContext<'a> {
     pub regs: &'a ThreadState64,
     pub base: Option<u64>,
-    pub read_mem: Option<&'a dyn Fn(usize) -> io::Result<Vec<u8>>>,
-    /// 変数名を (アドレス, バイト数) に解決するコールバック
+    pub read_mem: Option<&'a dyn Fn(usize, usize) -> io::Result<Vec<u8>>>,
+    /// 変数名を (アドレス, バイト数, type_name, is_pointer, pointee_type) に解決するコールバック
     pub resolve_var: Option<&'a dyn Fn(&str) -> Result<(u64, u8), String>>,
+    /// 変数のアドレスのみを返すコールバック (&演算子用)
+    pub addr_of_var: Option<&'a dyn Fn(&str) -> Result<u64, String>>,
+    /// struct 型名とフィールド名から (offset, size) を返すコールバック
+    pub resolve_field: Option<&'a dyn Fn(&str, &str) -> Result<(u64, u8), String>>,
+    /// 変数の型名 (type_name, is_pointer, pointee_type) を返すコールバック
+    pub type_of_var: Option<&'a dyn Fn(&str) -> Result<(String, bool, String), String>>,
 }
 
 impl<'a> EvalContext<'a> {
     pub fn new(
         regs: &'a ThreadState64,
         base: Option<u64>,
-        read_mem: Option<&'a dyn Fn(usize) -> io::Result<Vec<u8>>>,
+        read_mem: Option<&'a dyn Fn(usize, usize) -> io::Result<Vec<u8>>>,
     ) -> Self {
         Self {
             regs,
             base,
             read_mem,
             resolve_var: None,
+            addr_of_var: None,
+            resolve_field: None,
+            type_of_var: None,
         }
     }
 }
@@ -101,9 +116,10 @@ pub fn eval(expr: &Expr, ctx: &EvalContext) -> Result<u64, String> {
             let read = ctx
                 .read_mem
                 .ok_or_else(|| "memory read not available".to_string())?;
-            let bytes = read(addr as usize)
+            let n = (size as usize).clamp(1, 8);
+            let bytes = read(addr as usize, n)
                 .map_err(|e| format!("failed to read variable {}: {}", name, e))?;
-            let size = (size as usize).min(8).min(bytes.len());
+            let size = n.min(bytes.len());
             if size == 0 {
                 return Err(format!("failed to read variable {}", name));
             }
@@ -112,24 +128,40 @@ pub fn eval(expr: &Expr, ctx: &EvalContext) -> Result<u64, String> {
             Ok(u64::from_le_bytes(buf))
         }
         Expr::Unary(op, inner) => {
-            let v = eval(inner, ctx)?;
             match op {
-                Op::Neg => Ok(v.wrapping_neg()),
-                Op::Not => Ok(!v),
-                Op::Deref => {
-                    let read = ctx
-                        .read_mem
-                        .ok_or_else(|| "memory read not available for '*'".to_string())?;
-                    let bytes = read(v as usize)
-                        .map_err(|e| format!("failed to read memory: {}", e))?;
-                    if bytes.len() < 8 {
-                        return Err("not enough bytes to read 64-bit value".to_string());
+                Op::AddrOf => {
+                    // & 演算子: 変数のアドレスを返す
+                    match inner.as_ref() {
+                        Expr::Variable(name) => {
+                            let addr_of = ctx.addr_of_var.ok_or_else(|| {
+                                "address-of not available".to_string()
+                            })?;
+                            addr_of(name)
+                        }
+                        _ => Err("& can only be applied to a variable name".to_string()),
                     }
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&bytes[..8]);
-                    Ok(u64::from_le_bytes(buf))
                 }
-                _ => Err(format!("unsupported unary operator: {:?}", op)),
+                _ => {
+                    let v = eval(inner, ctx)?;
+                    match op {
+                        Op::Neg => Ok(v.wrapping_neg()),
+                        Op::Not => Ok(!v),
+                        Op::Deref => {
+                            let read = ctx
+                                .read_mem
+                                .ok_or_else(|| "memory read not available for '*'".to_string())?;
+                            let bytes = read(v as usize, 8)
+                                .map_err(|e| format!("failed to read memory: {}", e))?;
+                            if bytes.len() < 8 {
+                                return Err("not enough bytes to read 64-bit value".to_string());
+                            }
+                            let mut buf = [0u8; 8];
+                            buf.copy_from_slice(&bytes[..8]);
+                            Ok(u64::from_le_bytes(buf))
+                        }
+                        _ => Err(format!("unsupported unary operator: {:?}", op)),
+                    }
+                }
             }
         }
         Expr::Binary(op, l, r) => {
@@ -160,7 +192,83 @@ pub fn eval(expr: &Expr, ctx: &EvalContext) -> Result<u64, String> {
             };
             Ok(res)
         }
+        Expr::Member(base_expr, field) => {
+            eval_member(base_expr, field, false, ctx)
+        }
+        Expr::PtrMember(base_expr, field) => {
+            eval_member(base_expr, field, true, ctx)
+        }
     }
+}
+
+/// `expr.field` または `expr->field` を評価します。
+/// is_ptr=true のとき base_expr を先にデリファレンスします。
+fn eval_member(
+    base_expr: &Expr,
+    field: &str,
+    is_ptr: bool,
+    ctx: &EvalContext,
+) -> Result<u64, String> {
+    let resolve_field = ctx.resolve_field.ok_or_else(|| {
+        "struct field resolution not available".to_string()
+    })?;
+
+    // 変数名から型を取得してフィールドオフセットを解決する
+    let base_var_name = match base_expr {
+        Expr::Variable(n) => Some(n.as_str()),
+        _ => None,
+    };
+
+    // base アドレスを取得
+    let base_addr = if is_ptr {
+        // -> : まず変数値 (ポインタ値) を読む
+        eval(base_expr, ctx)?
+    } else {
+        // . : 変数のアドレスそのもの
+        match base_var_name {
+            Some(name) => {
+                let addr_of = ctx.addr_of_var.ok_or_else(|| {
+                    "address-of not available for '.'".to_string()
+                })?;
+                addr_of(name)?
+            }
+            None => {
+                // 式の値をアドレスとして使う (例: (*p).field)
+                eval(base_expr, ctx)?
+            }
+        }
+    };
+
+    // 型名を取得
+    let type_name: String = if let Some(name) = base_var_name {
+        let type_of = ctx.type_of_var.ok_or_else(|| {
+            "type resolution not available".to_string()
+        })?;
+        let (tname, is_pointer, pointee) = type_of(name)?;
+        if is_ptr {
+            // -> : ポインタが指す型
+            pointee
+        } else {
+            // . : 変数の型（ポインタなら除去）
+            if is_pointer { pointee } else { tname }
+        }
+    } else {
+        return Err(format!("cannot determine type for '{:?}'", base_expr));
+    };
+
+    let (offset, size) = resolve_field(&type_name, field)?;
+
+    // base_addr + offset からメモリを読む
+    let read = ctx.read_mem.ok_or_else(|| "memory read not available".to_string())?;
+    let n = (size as usize).clamp(1, 8);
+    let bytes = read((base_addr + offset) as usize, n)
+        .map_err(|e| format!("failed to read {}.{}: {}", type_name, field, e))?;
+    let size = n.min(bytes.len());
+    let mut buf = [0u8; 8];
+    if size > 0 {
+        buf[..size].copy_from_slice(&bytes[..size]);
+    }
+    Ok(u64::from_le_bytes(buf))
 }
 
 struct Lexer<'a> {
@@ -203,7 +311,14 @@ impl<'a> Lexer<'a> {
         self.pos += c.len_utf8();
         match c {
             '+' => Token::Plus,
-            '-' => Token::Minus,
+            '-' => {
+                if self.pos < self.input.len() && self.input[self.pos..].starts_with('>') {
+                    self.pos += '>'.len_utf8();
+                    Token::Arrow
+                } else {
+                    Token::Minus
+                }
+            }
             '*' => Token::Mul,
             '/' => Token::Div,
             '%' => Token::Mod,
@@ -229,6 +344,7 @@ impl<'a> Lexer<'a> {
                     Token::End
                 }
             }
+            '.' => Token::Dot,
             '$' => self.read_register(),
             '0'..='9' => self.read_number(),
             c if c.is_alphabetic() || c == '_' => self.read_ident(c),
@@ -478,8 +594,41 @@ impl<'a> Parser<'a> {
                 let inner = self.parse_unary()?;
                 Ok(Expr::Unary(Op::Deref, Box::new(inner)))
             }
-            _ => self.parse_primary(),
+            Token::And => {
+                // & 単項演算子: アドレス参照
+                self.lexer.bump();
+                let inner = self.parse_unary()?;
+                Ok(Expr::Unary(Op::AddrOf, Box::new(inner)))
+            }
+            _ => self.parse_postfix(),
         }
+    }
+
+    /// プライマリ式の後に続く . / -> チェーンを処理します。
+    fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            match self.lexer.peek() {
+                Token::Dot => {
+                    self.lexer.bump();
+                    let field = match self.lexer.peek() {
+                        Token::Ident(n) => { let n = n.clone(); self.lexer.bump(); n }
+                        tok => return Err(format!("expected field name after '.', got {:?}", tok)),
+                    };
+                    expr = Expr::Member(Box::new(expr), field);
+                }
+                Token::Arrow => {
+                    self.lexer.bump();
+                    let field = match self.lexer.peek() {
+                        Token::Ident(n) => { let n = n.clone(); self.lexer.bump(); n }
+                        tok => return Err(format!("expected field name after '->', got {:?}", tok)),
+                    };
+                    expr = Expr::PtrMember(Box::new(expr), field);
+                }
+                _ => break,
+            }
+        }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {

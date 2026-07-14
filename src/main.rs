@@ -16,6 +16,8 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use debugger::{Debugger, WaitStatus};
+#[cfg(target_arch = "x86_64")]
+use register::{WatchCondition, WatchLen};
 use leak_tracker::{LeakTracker, auto_cont};
 use symbols::{FrameBaseDef, Symbols, Variable, VarLocation};
 
@@ -32,6 +34,86 @@ unsafe extern "C" fn sigint_handler(_: libc::c_int) {
             libc::kill(pid, libc::SIGINT);
         }
     }
+}
+
+/// ソフトウェアウォッチポイント（ハードウェアが使えない環境用）
+struct SoftWatchpoint {
+    id: usize,
+    addr: usize,
+    size: usize,
+    desc: String,
+    prev_value: Vec<u8>,
+}
+
+/// バイト列を u64 に変換します（リトルエンディアン、最大 8 バイト）。
+fn bytes_to_u64(b: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = b.len().min(8);
+    buf[..n].copy_from_slice(&b[..n]);
+    u64::from_le_bytes(buf)
+}
+
+/// ソフトウェアウォッチポイントを確認し、変化があれば報告します。
+/// 変化したウォッチポイントのインデックスを返します。
+fn check_soft_watches(dbg: &Debugger, watches: &mut Vec<SoftWatchpoint>) -> Option<usize> {
+    for (i, wp) in watches.iter_mut().enumerate() {
+        if let Ok(new) = dbg.read_memory(wp.addr, wp.size) {
+            if new != wp.prev_value {
+                let old_val = bytes_to_u64(&wp.prev_value);
+                let new_val = bytes_to_u64(&new);
+                println!(
+                    "\nSoftware watchpoint #{}: {} changed",
+                    wp.id, wp.desc
+                );
+                println!("  old = {}  ({:#x})", old_val as i64, old_val);
+                println!("  new = {}  ({:#x})", new_val as i64, new_val);
+                wp.prev_value = new;
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// ソフトウェアウォッチポイント用の cont: シングルステップしながら値変化を検出します。
+fn soft_watch_cont(
+    dbg: &mut Debugger,
+    watches: &mut Vec<SoftWatchpoint>,
+) -> io::Result<WaitStatus> {
+    const MAX_STEPS: usize = 5_000_000;
+    let mut last_progress = 0usize;
+
+    for i in 0..MAX_STEPS {
+        if i > 0 && i - last_progress >= 100_000 {
+            eprint!("\r[soft watch] stepping... {}  ", i);
+            let _ = io::stderr().flush();
+            last_progress = i;
+        }
+
+        let status = dbg.step()?;
+
+        if !matches!(status, WaitStatus::Stopped { .. }) {
+            if last_progress > 0 { eprint!("\r{:<60}\r", ""); }
+            return Ok(status);
+        }
+
+        // 値変化チェック
+        if check_soft_watches(dbg, watches).is_some() {
+            if last_progress > 0 { eprint!("\r{:<60}\r", ""); }
+            return Ok(status);
+        }
+
+        // ユーザーブレークポイントに着地したら停止
+        if dbg.is_at_breakpoint() {
+            if last_progress > 0 { eprint!("\r{:<60}\r", ""); }
+            return Ok(status);
+        }
+    }
+
+    eprint!("\r{:<60}\r", "");
+    eprintln!("[soft watch] ステップ上限 ({} 命令) に達しました", MAX_STEPS);
+    let pc = dbg.pc().unwrap_or(0);
+    Ok(WaitStatus::Stopped { signal: libc::SIGTRAP, pc })
 }
 
 fn setup_sigint_handler() {
@@ -118,14 +200,37 @@ fn eval_expression(
 ) -> Result<u64, String> {
     let expr = expr::parse(expr_str)?;
     let regs = dbg.registers().map_err(|e| e.to_string())?;
-    let read = |addr: usize| dbg.read_memory(addr, 8);
+    let read = |addr: usize, n: usize| dbg.read_memory(addr, n);
     let resolve = |name: &str| resolve_variable(dbg, base, syms, name);
+    let addr_of = |name: &str| -> Result<u64, String> {
+        resolve_variable(dbg, base, syms, name).map(|(addr, _)| addr)
+    };
+    let type_of = |name: &str| -> Result<(String, bool, String), String> {
+        let syms = syms.ok_or("no debug info")?;
+        let base = base.ok_or("image base unknown")?;
+        let slide = syms.slide(base);
+        let pc = dbg.pc().map_err(|e| e.to_string())?;
+        let var = syms.find_variable(name, pc.wrapping_sub(slide))
+            .ok_or_else(|| format!("variable not found: {}", name))?;
+        Ok((var.type_name.clone(), var.is_pointer, var.pointee_type.clone()))
+    };
+    let resolve_field = |type_name: &str, field: &str| -> Result<(u64, u8), String> {
+        let syms = syms.ok_or("no debug info")?;
+        let si = syms.find_struct(type_name)
+            .ok_or_else(|| format!("unknown struct type: {}", type_name))?;
+        let fi = si.fields.iter().find(|f| f.name == field)
+            .ok_or_else(|| format!("field '{}' not found in struct '{}'", field, type_name))?;
+        Ok((fi.offset, fi.byte_size))
+    };
     let mut ctx = expr::EvalContext::new(
         &regs,
         base,
-        Some(&read as &dyn Fn(usize) -> io::Result<Vec<u8>>),
+        Some(&read as &dyn Fn(usize, usize) -> io::Result<Vec<u8>>),
     );
-    ctx.resolve_var = Some(&resolve as &dyn Fn(&str) -> Result<(u64, u8), String>);
+    ctx.resolve_var   = Some(&resolve       as &dyn Fn(&str) -> Result<(u64, u8), String>);
+    ctx.addr_of_var   = Some(&addr_of       as &dyn Fn(&str) -> Result<u64, String>);
+    ctx.type_of_var   = Some(&type_of       as &dyn Fn(&str) -> Result<(String, bool, String), String>);
+    ctx.resolve_field = Some(&resolve_field as &dyn Fn(&str, &str) -> Result<(u64, u8), String>);
     expr::eval(&expr, &ctx)
 }
 
@@ -722,6 +827,8 @@ fn main() -> io::Result<()> {
     let stdin = io::stdin();
     let mut line = String::new();
     let mut leak_tracker: Option<LeakTracker> = None;
+    let mut soft_watches: Vec<SoftWatchpoint> = Vec::new();
+    let mut next_sw_id: usize = 0;
 
     loop {
         // 起動直後は task_for_pid が未準備で失敗することがあるため、
@@ -751,6 +858,10 @@ fn main() -> io::Result<()> {
                 println!("  h, help                      show this help");
                 println!("  b, break <loc>               set breakpoint (addr | base+off | symbol | file:line)");
                 println!("  del, delete <N|addr|all>     delete breakpoint by number, address, or all");
+                println!("  del watch <N>                delete watchpoint by slot number");
+                println!("  watch <addr> [size]          set write watchpoint (size: 1/2/4/8, default 4)");
+                println!("  rwatch <addr> [size]         set read/write watchpoint");
+                println!("  show watch                   list watchpoints");
                 println!("  c, continue, cont            continue execution");
                 println!("  s, step                      step one source line (step into)");
                 println!("  n, next                      step one source line (step over)");
@@ -801,7 +912,32 @@ fn main() -> io::Result<()> {
             }
             "del" | "delete" => {
                 if parts.len() < 2 {
-                    eprintln!("usage: del <number> | del <addr> | del all");
+                    eprintln!("usage: del <number> | del <addr> | del all | del watch <N>");
+                    continue;
+                }
+                // del watch <N> — ウォッチポイント削除
+                if parts[1] == "watch" {
+                    let n: usize = match parts.get(2).and_then(|s| s.parse().ok()) {
+                        Some(n) => n,
+                        None => {
+                            eprintln!("usage: del watch <id>");
+                            continue;
+                        }
+                    };
+                    // ソフトウェアウォッチポイントを先に確認
+                    if let Some(pos) = soft_watches.iter().position(|w| w.id == n) {
+                        soft_watches.remove(pos);
+                        println!("Software watchpoint #{} deleted.", n);
+                        continue;
+                    }
+                    // ハードウェアウォッチポイント (x86_64)
+                    #[cfg(target_arch = "x86_64")]
+                    match dbg.remove_watchpoint_slot(n) {
+                        Ok(()) => println!("Hardware watchpoint #{} deleted.", n),
+                        Err(e) => eprintln!("del watch: {}", e),
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    eprintln!("del watch: watchpoint #{} not found", n);
                     continue;
                 }
                 if parts[1] == "all" {
@@ -834,14 +970,97 @@ fn main() -> io::Result<()> {
                     eprintln!("del: invalid argument '{}' (use number or address)", parts[1]);
                 }
             }
+            // watch <addr> [1|2|4|8]   書き込みウォッチポイント
+            // rwatch <addr> [size]      読み書きウォッチポイント
+            // awatch <addr> [size]      読み書きウォッチポイント (rwatch の別名)
+            // del watch <N>             ウォッチポイント削除
+            // show watch                ウォッチポイント一覧
+            #[cfg(target_arch = "x86_64")]
+            "watch" | "rwatch" | "awatch" => {
+                if parts.len() < 2 {
+                    eprintln!("usage: {} <addr|expr> [size]  (size: 1/2/4/8, default 4)", parts[0]);
+                    continue;
+                }
+                // 変数名ならアドレスを解決、それ以外は数値アドレス式として評価
+                let addr: usize = if is_identifier(parts[1]) {
+                    match resolve_variable(&dbg, base, syms.as_ref(), parts[1]) {
+                        Ok((a, _)) => a as usize,
+                        Err(_) => {
+                            // 変数として解決できなければ数値アドレス式として試みる
+                            match parse_addr(parts[1], base)
+                                .or_else(|| eval_expression(&dbg, base, syms.as_ref(), parts[1]).ok().map(|v| v as usize))
+                            {
+                                Some(a) => a,
+                                None => {
+                                    eprintln!("watch: cannot resolve '{}' as variable or address", parts[1]);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match parse_addr(parts[1], base)
+                        .or_else(|| eval_expression(&dbg, base, syms.as_ref(), parts[1]).ok().map(|v| v as usize))
+                    {
+                        Some(a) => a,
+                        None => {
+                            eprintln!("watch: invalid address '{}'", parts[1]);
+                            continue;
+                        }
+                    }
+                };
+                let size: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+                let len = WatchLen::from_bytes(size);
+                let cond = if parts[0] == "watch" {
+                    WatchCondition::Write
+                } else {
+                    WatchCondition::ReadWrite
+                };
+                match dbg.set_watchpoint(addr, cond, len) {
+                    Ok(slot) => println!(
+                        "Hardware watchpoint #{} set at {:#018x} ({} byte(s), {})",
+                        slot,
+                        addr,
+                        len.as_bytes(),
+                        if parts[0] == "watch" { "write" } else { "read/write" }
+                    ),
+                    Err(_) => {
+                        // ハードウェアウォッチポイントが使えない環境 (Rosetta 2 等)
+                        // → ソフトウェアウォッチポイントにフォールバック
+                        let prev = dbg.read_memory(addr, size).unwrap_or_default();
+                        let id = next_sw_id;
+                        next_sw_id += 1;
+                        soft_watches.push(SoftWatchpoint {
+                            id,
+                            addr,
+                            size,
+                            desc: parts[1].to_string(),
+                            prev_value: prev,
+                        });
+                        println!(
+                            "Software watchpoint #{} set at {:#018x} ({} byte(s))  [{}]",
+                            id, addr, size, parts[1]
+                        );
+                    }
+                }
+            }
             "c" | "continue" | "cont" => {
                 CHILD_RUNNING.store(true, Ordering::SeqCst);
-                let raw = dbg.cont()?;
-                let status = auto_cont(&mut dbg, &mut leak_tracker, raw)?;
+                let status = if !soft_watches.is_empty() {
+                    // ソフトウェアウォッチポイントが有効 → シングルステップループ
+                    soft_watch_cont(&mut dbg, &mut soft_watches)?
+                } else {
+                    let raw = dbg.cont()?;
+                    auto_cont(&mut dbg, &mut leak_tracker, raw)?
+                };
                 CHILD_RUNNING.store(false, Ordering::SeqCst);
                 print_status(status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
+                }
+                #[cfg(target_arch = "x86_64")]
+                if let Some(wp_addr) = dbg.at_watchpoint() {
+                    println!("Hardware watchpoint hit at {:#018x}", wp_addr);
                 }
                 show_context(&dbg, base, syms.as_ref());
             }
@@ -853,6 +1072,7 @@ fn main() -> io::Result<()> {
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
+                check_soft_watches(&dbg, &mut soft_watches);
                 show_context(&dbg, base, syms.as_ref());
             }
             "n" | "next" => {
@@ -863,6 +1083,7 @@ fn main() -> io::Result<()> {
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
+                check_soft_watches(&dbg, &mut soft_watches);
                 show_context(&dbg, base, syms.as_ref());
             }
             "si" | "stepi" => {
@@ -873,6 +1094,7 @@ fn main() -> io::Result<()> {
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
+                check_soft_watches(&dbg, &mut soft_watches);
                 show_context(&dbg, base, syms.as_ref());
             }
             "up" | "finish" => {
@@ -955,12 +1177,8 @@ fn main() -> io::Result<()> {
                 }
                 match eval_expression(&dbg, base, syms.as_ref(), expr_str) {
                     Ok(v) => {
-                        // 変数名のとき "name = " プレフィックスを付ける
-                        let prefix = if is_identifier(expr_str) {
-                            format!("{} = ", expr_str)
-                        } else {
-                            String::new()
-                        };
+                        // 常に "expr = " プレフィックスを付ける
+                        let prefix = format!("{} = ", expr_str);
                         match fmt {
                             Some('x') => println!("{}{:#018x}", prefix, v),
                             Some('X') => println!("{}{:#018X}", prefix, v),
@@ -1009,7 +1227,8 @@ fn main() -> io::Result<()> {
                                 if is_identifier(expr_str) {
                                     println!("{}{}  ({:#x})", prefix, v as i64, v);
                                 } else {
-                                    println!("{:#018x}  ({})", v, v);
+                                    // &var や *ptr など → アドレス形式で表示
+                                    println!("{}{:#018x}  ({})", prefix, v, v);
                                 }
                             }
                         }
@@ -1095,22 +1314,32 @@ fn main() -> io::Result<()> {
                 }
 
                 if !tried_as_reg {
-                    // 変数名または数値アドレス式として扱う
-                    let (addr, byte_size) = if is_identifier(target) {
-                        match resolve_variable(&dbg, base, syms.as_ref(), target) {
-                            Ok((a, sz)) => (a, sz as usize),
-                            Err(e) => {
-                                eprintln!("set: {}", e);
-                                continue;
-                            }
-                        }
-                    } else {
-                        match eval_expression(&dbg, base, syms.as_ref(), target) {
-                            Ok(v) => (v, 8),
-                            Err(e) => {
-                                eprintln!("set: {}", e);
-                                continue;
-                            }
+                    // lvalue を (書き込みアドレス, バイト数, 表示用ラベル) に解決する
+                    enum LvalKind { Var(String), Ptr(u64) }
+                    let resolved: Result<(u64, usize, LvalKind), String> =
+                        if target.starts_with('*') {
+                            // *expr: 内側の式を評価してポインタ値を得て、そこへ書き込む
+                            let inner = target[1..].trim();
+                            eval_expression(&dbg, base, syms.as_ref(), inner)
+                                .map(|ptr| (ptr, 8, LvalKind::Ptr(ptr)))
+                        } else if target.starts_with('&') {
+                            // &var: 変数のアドレス = 変数自体への書き込みと同じ
+                            let inner = target[1..].trim();
+                            resolve_variable(&dbg, base, syms.as_ref(), inner)
+                                .map(|(a, sz)| (a, sz as usize, LvalKind::Var(inner.to_string())))
+                        } else if is_identifier(target) {
+                            resolve_variable(&dbg, base, syms.as_ref(), target)
+                                .map(|(a, sz)| (a, sz as usize, LvalKind::Var(target.to_string())))
+                        } else {
+                            eval_expression(&dbg, base, syms.as_ref(), target)
+                                .map(|v| (v, 8, LvalKind::Ptr(v)))
+                        };
+
+                    let (addr, byte_size, kind) = match resolved {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("set: {}", e);
+                            continue;
                         }
                     };
                     let write_size = byte_size.clamp(1, 8);
@@ -1119,10 +1348,9 @@ fn main() -> io::Result<()> {
                         eprintln!("failed to write memory: {}", e);
                         continue;
                     }
-                    if is_identifier(target) {
-                        println!("{} = {}", target, value as i64);
-                    } else {
-                        println!("[{:#018x}] = {}", addr, value as i64);
+                    match kind {
+                        LvalKind::Var(name) => println!("{} = {}", name, value as i64),
+                        LvalKind::Ptr(ptr)  => println!("[{:#018x}] = {}", ptr, value as i64),
                     }
                 }
             }
@@ -1144,6 +1372,38 @@ fn main() -> io::Result<()> {
                 show_disasm(&parts, &dbg, base, syms.as_ref());
             }
             "show" => {
+                if parts.get(1) == Some(&"watch") {
+                    let mut any = false;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let wps = dbg.watchpoint_slots();
+                        for (slot, info) in &wps {
+                            any = true;
+                            let cond_str = match info.cond {
+                                WatchCondition::Write     => "write",
+                                WatchCondition::ReadWrite => "read/write",
+                                WatchCondition::Execute   => "execute",
+                                WatchCondition::IoRW      => "io-rw",
+                            };
+                            println!(
+                                "HW WP#{} {:#018x}  {} byte(s)  {}",
+                                slot, info.addr, info.len.as_bytes(), cond_str
+                            );
+                        }
+                    }
+                    for wp in &soft_watches {
+                        any = true;
+                        let cur = bytes_to_u64(&wp.prev_value);
+                        println!(
+                            "SW WP#{} {:#018x}  {} byte(s)  [{}]  current={}",
+                            wp.id, wp.addr, wp.size, wp.desc, cur as i64
+                        );
+                    }
+                    if !any {
+                        println!("No watchpoints.");
+                    }
+                    continue;
+                }
                 if parts.get(1) == Some(&"leaks") {
                     match leak_tracker.as_ref() {
                         Some(tr) => tr.show_leaks(syms.as_ref(), base),

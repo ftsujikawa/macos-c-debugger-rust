@@ -361,5 +361,102 @@ pub struct ArmDebugState64 {
 #[cfg(target_arch = "aarch64")]
 pub const HW_BP_BCR_ENABLE: u64 = 0x1E5;
 
+/// x86_64 デバッグ状態 (x86_DEBUG_STATE64, flavor = 12)
+/// DR0〜DR3 がウォッチポイント / ブレークポイントアドレス。
+/// DR6 = ステータス、DR7 = 制御。
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Default, Clone, Debug)]
+pub struct X86DebugState64 {
+    pub __dr0: u64,
+    pub __dr1: u64,
+    pub __dr2: u64,
+    pub __dr3: u64,
+    pub __dr4: u64,
+    pub __dr5: u64,
+    pub __dr6: u64,
+    pub __dr7: u64,
+}
+
+/// DR7 制御レジスタのフィールドを組み立てます。
+///
+/// slot: 0〜3、condition: WatchCondition
+#[cfg(target_arch = "x86_64")]
+pub fn dr7_set_slot(dr7: u64, slot: usize, cond: WatchCondition, len: WatchLen) -> u64 {
+    // 各スロットの有効ビット: L0=bit0, L1=bit2, L2=bit4, L3=bit6
+    let enable_bit = slot * 2;
+    // R/W フィールド: bits [17+slot*4 .. 18+slot*4]
+    let rw_shift = 16 + slot * 4;
+    // LEN フィールド: bits [19+slot*4 .. 20+slot*4]
+    let len_shift = 18 + slot * 4;
+
+    let rw_bits = cond as u64;
+    let len_bits = len as u64;
+
+    // 対象スロットの既存ビットをクリア
+    let mask = (0b11u64 << rw_shift) | (0b11u64 << len_shift) | (0b11u64 << enable_bit);
+    let cleared = dr7 & !mask;
+
+    cleared
+        | (1u64 << enable_bit)           // Local enable
+        | (rw_bits << rw_shift)
+        | (len_bits << len_shift)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn dr7_clear_slot(dr7: u64, slot: usize) -> u64 {
+    let enable_bit = slot * 2;
+    let rw_shift = 16 + slot * 4;
+    let len_shift = 18 + slot * 4;
+    let mask = (0b11u64 << rw_shift) | (0b11u64 << len_shift) | (0b11u64 << enable_bit);
+    dr7 & !mask
+}
+
+/// ウォッチポイントのトリガー条件 (DR7 R/W フィールド)
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchCondition {
+    /// 実行 (ブレークポイント)
+    #[allow(dead_code)]
+    Execute = 0b00,
+    /// 書き込み
+    Write    = 0b01,
+    /// 読み書き（I/O アドレス空間）
+    #[allow(dead_code)]
+    IoRW     = 0b10,
+    /// 読み書き（データアドレス空間）
+    ReadWrite = 0b11,
+}
+
+/// ウォッチポイントの監視バイト幅 (DR7 LEN フィールド)
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchLen {
+    Byte1  = 0b00,
+    Word2  = 0b01,
+    QWord8 = 0b10,
+    Dword4 = 0b11,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl WatchLen {
+    pub fn from_bytes(n: usize) -> Self {
+        match n {
+            2 => Self::Word2,
+            4 => Self::Dword4,
+            8 => Self::QWord8,
+            _ => Self::Byte1,
+        }
+    }
+    pub fn as_bytes(self) -> usize {
+        match self {
+            Self::Byte1  => 1,
+            Self::Word2  => 2,
+            Self::Dword4 => 4,
+            Self::QWord8 => 8,
+        }
+    }
+}
+
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("unsupported architecture: this debugger base is only for x86_64 or aarch64 macOS");

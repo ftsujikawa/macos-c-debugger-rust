@@ -53,6 +53,17 @@ const PAGE_SIZE: usize = 16384;
 const PAGE_SIZE: usize = 4096;
 const PAGE_MASK: usize = PAGE_SIZE - 1;
 
+const THREAD_IDENTIFIER_INFO: i32 = 4;
+const THREAD_IDENTIFIER_INFO_COUNT: u32 = 6; // sizeof(thread_identifier_info_data_t) / 4
+
+#[repr(C)]
+#[derive(Default)]
+struct ThreadIdentifierInfo {
+    thread_id: u64,
+    thread_handle: u64,
+    dispatch_qaddr: u64,
+}
+
 extern "C" {
     static mut mach_task_self_: MachPort;
 
@@ -74,6 +85,14 @@ extern "C" {
         new_state: *const u32,
         new_stateCnt: u32,
     ) -> KernReturn;
+    fn thread_info(
+        target_act: MachPort,
+        flavor: i32,
+        thread_info_out: *mut u32,
+        thread_info_outCnt: *mut u32,
+    ) -> KernReturn;
+    fn thread_suspend(target_thread: MachPort) -> KernReturn;
+    fn thread_resume(target_thread: MachPort) -> KernReturn;
     fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
     fn vm_deallocate(target_task: MachPort, address: usize, size: usize) -> KernReturn;
 
@@ -134,8 +153,9 @@ pub fn get_task(pid: Pid) -> std::io::Result<MachPort> {
     Ok(task)
 }
 
-/// タスク内の先頭スレッド番号を取得します。
-pub fn get_main_thread(task: MachPort) -> std::io::Result<MachPort> {
+/// タスク内の全スレッドポートを取得します。
+/// 返されたポートは呼び出し元が所有し、不要になったら `mach_port_deallocate` すること。
+pub fn list_threads(task: MachPort) -> std::io::Result<Vec<MachPort>> {
     unsafe {
         let mut list: *mut MachPort = std::ptr::null_mut();
         let mut count: u32 = 0;
@@ -152,18 +172,51 @@ pub fn get_main_thread(task: MachPort) -> std::io::Result<MachPort> {
                 "task_threads returned no threads",
             ));
         }
-        let thread = *list;
-        // MIG から返された配列を解放
+        let threads = std::slice::from_raw_parts(list, count as usize).to_vec();
+        // MIG から返された配列を解放 (中身のポートそのものは呼び出し元が保持)
         let _ = vm_deallocate(task_self(), list as usize, count as usize * std::mem::size_of::<MachPort>());
-        Ok(thread)
+        Ok(threads)
     }
 }
 
-/// レジスタ状態を取得します。
-pub fn get_registers(pid: Pid) -> std::io::Result<ThreadState64> {
-    let task = get_task(pid)?;
+/// スレッドの安定した一意 ID (lldb 等で表示される tid 相当) を取得します。
+pub fn thread_unique_id(thread: MachPort) -> std::io::Result<u64> {
     unsafe {
-        let thread = get_main_thread(task)?;
+        let mut info = ThreadIdentifierInfo::default();
+        let mut count = THREAD_IDENTIFIER_INFO_COUNT;
+        let ret = thread_info(
+            thread,
+            THREAD_IDENTIFIER_INFO,
+            &mut info as *mut ThreadIdentifierInfo as *mut u32,
+            &mut count,
+        );
+        mach_err(ret, "thread_info (THREAD_IDENTIFIER_INFO)")?;
+        Ok(info.thread_id)
+    }
+}
+
+/// 不要になったポート(スレッドポートなど)を解放します。
+pub fn deallocate_port(port: MachPort) {
+    unsafe {
+        let _ = mach_port_deallocate(task_self(), port);
+    }
+}
+
+/// スレッドを Mach レベルで一時停止します(ptrace とは独立)。
+pub fn suspend_thread(thread: MachPort) -> std::io::Result<()> {
+    let ret = unsafe { thread_suspend(thread) };
+    mach_err(ret, "thread_suspend")
+}
+
+/// `suspend_thread` で止めたスレッドを再開します。
+pub fn resume_thread(thread: MachPort) -> std::io::Result<()> {
+    let ret = unsafe { thread_resume(thread) };
+    mach_err(ret, "thread_resume")
+}
+
+/// レジスタ状態を取得します。
+pub fn get_registers(thread: MachPort) -> std::io::Result<ThreadState64> {
+    unsafe {
         let mut state = ThreadState64::default();
         let mut count = (std::mem::size_of::<ThreadState64>() / std::mem::size_of::<u32>()) as u32;
         let ret = thread_get_state(
@@ -172,8 +225,6 @@ pub fn get_registers(pid: Pid) -> std::io::Result<ThreadState64> {
             &mut state as *mut ThreadState64 as *mut u32,
             &mut count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_get_state")?;
         Ok(state)
     }
@@ -181,10 +232,8 @@ pub fn get_registers(pid: Pid) -> std::io::Result<ThreadState64> {
 
 /// 浮動小数点レジスタ状態を取得します (x86_64 のみ)。
 #[cfg(target_arch = "x86_64")]
-pub fn get_float_registers(pid: Pid) -> std::io::Result<FloatState64> {
-    let task = get_task(pid)?;
+pub fn get_float_registers(thread: MachPort) -> std::io::Result<FloatState64> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let mut state = FloatState64::default();
         let mut count = FLOAT_STATE64_COUNT;
         let ret = thread_get_state(
@@ -193,8 +242,6 @@ pub fn get_float_registers(pid: Pid) -> std::io::Result<FloatState64> {
             &mut state as *mut FloatState64 as *mut u32,
             &mut count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_get_state (float)")?;
         Ok(state)
     }
@@ -202,10 +249,8 @@ pub fn get_float_registers(pid: Pid) -> std::io::Result<FloatState64> {
 
 /// 浮動小数点レジスタ状態を設定します (x86_64 のみ)。
 #[cfg(target_arch = "x86_64")]
-pub fn set_float_registers(pid: Pid, state: &FloatState64) -> std::io::Result<()> {
-    let task = get_task(pid)?;
+pub fn set_float_registers(thread: MachPort, state: &FloatState64) -> std::io::Result<()> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let count = FLOAT_STATE64_COUNT;
         let ret = thread_set_state(
             thread,
@@ -213,8 +258,6 @@ pub fn set_float_registers(pid: Pid, state: &FloatState64) -> std::io::Result<()
             state as *const FloatState64 as *const u32,
             count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_set_state (float)")?;
         Ok(())
     }
@@ -222,10 +265,8 @@ pub fn set_float_registers(pid: Pid, state: &FloatState64) -> std::io::Result<()
 
 /// NEON/FP レジスタ状態を取得します (ARM64 のみ)。
 #[cfg(target_arch = "aarch64")]
-pub fn get_float_registers(pid: Pid) -> std::io::Result<ArmNeonState64> {
-    let task = get_task(pid)?;
+pub fn get_float_registers(thread: MachPort) -> std::io::Result<ArmNeonState64> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let mut state = ArmNeonState64::default();
         let mut count = ARM_NEON_STATE64_COUNT;
         let ret = thread_get_state(
@@ -234,8 +275,6 @@ pub fn get_float_registers(pid: Pid) -> std::io::Result<ArmNeonState64> {
             &mut state as *mut ArmNeonState64 as *mut u32,
             &mut count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_get_state (neon)")?;
         Ok(state)
     }
@@ -243,10 +282,8 @@ pub fn get_float_registers(pid: Pid) -> std::io::Result<ArmNeonState64> {
 
 /// NEON/FP レジスタ状態を設定します (ARM64 のみ)。
 #[cfg(target_arch = "aarch64")]
-pub fn set_float_registers(pid: Pid, state: &ArmNeonState64) -> std::io::Result<()> {
-    let task = get_task(pid)?;
+pub fn set_float_registers(thread: MachPort, state: &ArmNeonState64) -> std::io::Result<()> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let count = ARM_NEON_STATE64_COUNT;
         let ret = thread_set_state(
             thread,
@@ -254,18 +291,14 @@ pub fn set_float_registers(pid: Pid, state: &ArmNeonState64) -> std::io::Result<
             state as *const ArmNeonState64 as *const u32,
             count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_set_state (neon)")?;
         Ok(())
     }
 }
 
 /// レジスタ状態を設定します。
-pub fn set_registers(pid: Pid, state: &ThreadState64) -> std::io::Result<()> {
-    let task = get_task(pid)?;
+pub fn set_registers(thread: MachPort, state: &ThreadState64) -> std::io::Result<()> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let count = (std::mem::size_of::<ThreadState64>() / std::mem::size_of::<u32>()) as u32;
         let ret = thread_set_state(
             thread,
@@ -273,8 +306,6 @@ pub fn set_registers(pid: Pid, state: &ThreadState64) -> std::io::Result<()> {
             state as *const ThreadState64 as *const u32,
             count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_set_state")?;
         Ok(())
     }
@@ -282,10 +313,8 @@ pub fn set_registers(pid: Pid, state: &ThreadState64) -> std::io::Result<()> {
 
 /// ARM64 ハードウェアデバッグ状態を取得します。
 #[cfg(target_arch = "aarch64")]
-pub fn get_debug_state(pid: Pid) -> std::io::Result<ArmDebugState64> {
-    let task = get_task(pid)?;
+pub fn get_debug_state(thread: MachPort) -> std::io::Result<ArmDebugState64> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let mut state = ArmDebugState64::default();
         let mut count = ARM_DEBUG_STATE64_COUNT;
         let ret = thread_get_state(
@@ -294,8 +323,6 @@ pub fn get_debug_state(pid: Pid) -> std::io::Result<ArmDebugState64> {
             &mut state as *mut ArmDebugState64 as *mut u32,
             &mut count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_get_state (debug)")?;
         Ok(state)
     }
@@ -303,10 +330,8 @@ pub fn get_debug_state(pid: Pid) -> std::io::Result<ArmDebugState64> {
 
 /// ARM64 ハードウェアデバッグ状態を設定します。
 #[cfg(target_arch = "aarch64")]
-pub fn set_debug_state(pid: Pid, state: &ArmDebugState64) -> std::io::Result<()> {
-    let task = get_task(pid)?;
+pub fn set_debug_state(thread: MachPort, state: &ArmDebugState64) -> std::io::Result<()> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let count = ARM_DEBUG_STATE64_COUNT;
         let ret = thread_set_state(
             thread,
@@ -314,8 +339,6 @@ pub fn set_debug_state(pid: Pid, state: &ArmDebugState64) -> std::io::Result<()>
             state as *const ArmDebugState64 as *const u32,
             count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_set_state (debug)")?;
         Ok(())
     }
@@ -324,50 +347,50 @@ pub fn set_debug_state(pid: Pid, state: &ArmDebugState64) -> std::io::Result<()>
 /// 指定スロットにハードウェアブレークポイントを設定します。
 /// slot は 0..16 の範囲。
 #[cfg(target_arch = "aarch64")]
-pub fn set_hw_breakpoint_slot(pid: Pid, slot: usize, addr: usize) -> std::io::Result<()> {
+pub fn set_hw_breakpoint_slot(thread: MachPort, slot: usize, addr: usize) -> std::io::Result<()> {
     assert!(slot < 16, "HW BP slot must be 0..15");
-    let mut state = get_debug_state(pid)?;
+    let mut state = get_debug_state(thread)?;
     state.bvr[slot] = addr as u64;
     state.bcr[slot] = HW_BP_BCR_ENABLE;
-    set_debug_state(pid, &state)
+    set_debug_state(thread, &state)
 }
 
 /// 指定スロットのハードウェアブレークポイントをクリアします。
 #[cfg(target_arch = "aarch64")]
-pub fn clear_hw_breakpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
+pub fn clear_hw_breakpoint_slot(thread: MachPort, slot: usize) -> std::io::Result<()> {
     assert!(slot < 16, "HW BP slot must be 0..15");
-    let mut state = get_debug_state(pid)?;
+    let mut state = get_debug_state(thread)?;
     state.bvr[slot] = 0;
     state.bcr[slot] = 0;
-    set_debug_state(pid, &state)
+    set_debug_state(thread, &state)
 }
 
 /// 指定スロットにハードウェアウォッチポイントを設定します。
 /// slot は 0..4 の範囲。
 #[cfg(target_arch = "aarch64")]
 pub fn set_hw_watchpoint_slot(
-    pid: Pid,
+    thread: MachPort,
     slot: usize,
     addr: usize,
     cond: WatchCondition,
     len: WatchLen,
 ) -> std::io::Result<()> {
     assert!(slot < 4, "HW watchpoint slot must be 0..3");
-    let mut state = get_debug_state(pid)?;
+    let mut state = get_debug_state(thread)?;
     let (wvr, wcr) = wcr_encode(addr, cond, len);
     state.wvr[slot] = wvr;
     state.wcr[slot] = wcr;
-    set_debug_state(pid, &state)
+    set_debug_state(thread, &state)
 }
 
 /// 指定スロットのハードウェアウォッチポイントをクリアします。
 #[cfg(target_arch = "aarch64")]
-pub fn clear_hw_watchpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
+pub fn clear_hw_watchpoint_slot(thread: MachPort, slot: usize) -> std::io::Result<()> {
     assert!(slot < 4, "HW watchpoint slot must be 0..3");
-    let mut state = get_debug_state(pid)?;
+    let mut state = get_debug_state(thread)?;
     state.wvr[slot] = 0;
     state.wcr[slot] = 0;
-    set_debug_state(pid, &state)
+    set_debug_state(thread, &state)
 }
 
 /// 指定アドレスから `size` バイトを読みます。
@@ -595,10 +618,8 @@ pub fn detect_arch(pid: Pid) -> std::io::Result<Arch> {
 
 /// x86_64 デバッグレジスタ状態を取得します。
 #[cfg(target_arch = "x86_64")]
-pub fn get_debug_state(pid: Pid) -> std::io::Result<X86DebugState64> {
-    let task = get_task(pid)?;
+pub fn get_debug_state(thread: MachPort) -> std::io::Result<X86DebugState64> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let mut state = X86DebugState64::default();
         let mut count = DEBUG_STATE64_COUNT;
         let ret = thread_get_state(
@@ -607,8 +628,6 @@ pub fn get_debug_state(pid: Pid) -> std::io::Result<X86DebugState64> {
             &mut state as *mut X86DebugState64 as *mut u32,
             &mut count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         if ret != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -627,10 +646,8 @@ pub fn get_debug_state(pid: Pid) -> std::io::Result<X86DebugState64> {
 
 /// x86_64 デバッグレジスタ状態を設定します。
 #[cfg(target_arch = "x86_64")]
-pub fn set_debug_state(pid: Pid, state: &X86DebugState64) -> std::io::Result<()> {
-    let task = get_task(pid)?;
+pub fn set_debug_state(thread: MachPort, state: &X86DebugState64) -> std::io::Result<()> {
     unsafe {
-        let thread = get_main_thread(task)?;
         let count = DEBUG_STATE64_COUNT;
         let ret = thread_set_state(
             thread,
@@ -638,8 +655,6 @@ pub fn set_debug_state(pid: Pid, state: &X86DebugState64) -> std::io::Result<()>
             state as *const X86DebugState64 as *const u32,
             count,
         );
-        let _ = mach_port_deallocate(task_self(), thread);
-        let _ = mach_port_deallocate(task_self(), task);
         mach_err(ret, "thread_set_state (debug)")?;
         Ok(())
     }
@@ -648,14 +663,14 @@ pub fn set_debug_state(pid: Pid, state: &X86DebugState64) -> std::io::Result<()>
 /// 指定スロット (0〜3) にウォッチポイントを設定します。
 #[cfg(target_arch = "x86_64")]
 pub fn set_watchpoint_slot(
-    pid: Pid,
+    thread: MachPort,
     slot: usize,
     addr: usize,
     cond: WatchCondition,
     len: WatchLen,
 ) -> std::io::Result<()> {
     assert!(slot < 4, "watchpoint slot must be 0..3");
-    let mut state = get_debug_state(pid)?;
+    let mut state = get_debug_state(thread)?;
     // DRn にアドレスを設定
     match slot {
         0 => state.__dr0 = addr as u64,
@@ -665,14 +680,14 @@ pub fn set_watchpoint_slot(
         _ => unreachable!(),
     }
     state.__dr7 = dr7_set_slot(state.__dr7, slot, cond, len);
-    set_debug_state(pid, &state)
+    set_debug_state(thread, &state)
 }
 
 /// 指定スロットのウォッチポイントをクリアします。
 #[cfg(target_arch = "x86_64")]
-pub fn clear_watchpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
+pub fn clear_watchpoint_slot(thread: MachPort, slot: usize) -> std::io::Result<()> {
     assert!(slot < 4, "watchpoint slot must be 0..3");
-    let mut state = get_debug_state(pid)?;
+    let mut state = get_debug_state(thread)?;
     match slot {
         0 => state.__dr0 = 0,
         1 => state.__dr1 = 0,
@@ -681,14 +696,14 @@ pub fn clear_watchpoint_slot(pid: Pid, slot: usize) -> std::io::Result<()> {
         _ => unreachable!(),
     }
     state.__dr7 = dr7_clear_slot(state.__dr7, slot);
-    set_debug_state(pid, &state)
+    set_debug_state(thread, &state)
 }
 
 /// ヒットしたウォッチポイントスロット番号を DR6 から読み取ります。
 /// 戻り値: ヒットしたスロット番号のリスト (0〜3)
 #[cfg(target_arch = "x86_64")]
-pub fn watchpoint_hit_slots(pid: Pid) -> std::io::Result<Vec<usize>> {
-    let state = get_debug_state(pid)?;
+pub fn watchpoint_hit_slots(thread: MachPort) -> std::io::Result<Vec<usize>> {
+    let state = get_debug_state(thread)?;
     let dr6 = state.__dr6;
     let mut hits = Vec::new();
     for slot in 0..4 {
@@ -699,7 +714,7 @@ pub fn watchpoint_hit_slots(pid: Pid) -> std::io::Result<Vec<usize>> {
     // DR6 をクリア（次回判定のため）
     let mut cleared = state;
     cleared.__dr6 = 0;
-    let _ = set_debug_state(pid, &cleared);
+    let _ = set_debug_state(thread, &cleared);
     Ok(hits)
 }
 

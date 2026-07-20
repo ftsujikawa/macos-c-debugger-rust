@@ -1,7 +1,7 @@
 DEBUGGER     := target/debug/macos-c-debugger
 DBG_ENT      := debugger-entitlements.plist
 SAMPLE_ENT   := samples/entitlements.xml
-SAMPLES      := samples/hello samples/sleep
+SAMPLES      := samples/hello samples/sleep samples/threads
 CC           := clang
 ARCH         := $(shell uname -m)
 CFLAGS       := -g -O0 -arch $(ARCH)
@@ -35,6 +35,13 @@ samples/sleep: samples/sleep.c
 	$(CC) $(CFLAGS) -o $@ samples/sleep.o
 	dsymutil $@
 	rm -f samples/sleep.o
+	codesign -s - --entitlements $(SAMPLE_ENT) -f $@
+
+samples/threads: samples/threads.c
+	$(CC) $(CFLAGS) -c -o samples/threads.o $<
+	$(CC) $(CFLAGS) -o $@ samples/threads.o
+	dsymutil $@
+	rm -f samples/threads.o
 	codesign -s - --entitlements $(SAMPLE_ENT) -f $@
 
 clean:

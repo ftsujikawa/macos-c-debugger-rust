@@ -12,7 +12,6 @@ pub const PT_WRITE_I: c_int = 4;
 #[allow(dead_code)] pub const PT_WRITE_D: c_int = 5;
 pub const PT_CONTINUE: c_int = 7;
 pub const PT_KILL: c_int = 8;
-pub const PT_STEP: c_int = 9;
 #[allow(dead_code)]
 pub const PT_DETACH: c_int = 10;
 #[allow(unused)]
@@ -40,11 +39,6 @@ pub fn trace_me() -> std::io::Result<()> {
 /// 子プロセスの実行を再開します。
 pub fn cont(pid: Pid) -> std::io::Result<()> {
     unsafe { check(ptrace(PT_CONTINUE, pid, 1usize as *mut c_void, 0), "PT_CONTINUE") }
-}
-
-/// 子プロセスを 1 命令だけ実行します。
-pub fn step(pid: Pid) -> std::io::Result<()> {
-    unsafe { check(ptrace(PT_STEP, pid, 1usize as *mut c_void, 0), "PT_STEP") }
 }
 
 /// 子プロセスを終了します。

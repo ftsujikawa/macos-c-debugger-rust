@@ -5,7 +5,7 @@ use std::process::{Child, Command};
 
 use crate::arch::Arch;
 use crate::breakpoint::Breakpoint;
-use crate::mach;
+use crate::mach::{self, MachPort};
 use crate::ptrace::{self, Pid};
 use crate::register::ThreadState64;
 #[cfg(target_arch = "x86_64")]
@@ -22,6 +22,29 @@ pub enum WaitStatus {
     Unknown { status: i32 },
 }
 
+/// プロセスの起動経緯。子として spawn したのか、既存プロセスに attach したのか。
+enum Origin {
+    Spawned(#[allow(dead_code)] Child),
+    Attached,
+}
+
+/// タスク内の1スレッドのポートと表示用情報。
+struct ThreadEntry {
+    port: MachPort,
+    tid: u64,
+    /// `suspend_thread`/`resume_thread` によるユーザー指定の一時停止状態。
+    suspended: bool,
+}
+
+/// `threads()` で外部に返すスレッドのスナップショット情報。
+#[derive(Debug, Clone)]
+pub struct ThreadSummary {
+    pub index: usize,
+    pub tid: u64,
+    pub pc: Option<u64>,
+    pub suspended: bool,
+    pub current: bool,
+}
 
 /// ウォッチポイント情報 (x86_64)
 #[cfg(target_arch = "x86_64")]
@@ -46,7 +69,13 @@ pub struct WatchpointInfo {
 
 pub struct Debugger {
     pub pid: Pid,
-    _child: Child,
+    origin: Origin,
+    /// デバッグ対象タスクの Mach タスクポート。
+    task: MachPort,
+    /// タスク内の全スレッド (毎停止時に `refresh_threads` で更新)。
+    threads: Vec<ThreadEntry>,
+    /// レジスタ操作・ステップ実行の対象となる現在選択中スレッドのインデックス。
+    current_thread: usize,
     breakpoints: HashMap<usize, Breakpoint>,
     last_status: Option<WaitStatus>,
     /// 直前の停止がブレークポイントヒットによるものならそのアドレス
@@ -79,9 +108,22 @@ impl Debugger {
         let child = cmd.spawn()?;
         let pid = ptrace::pid_of(&child);
 
+        Self::new_internal(pid, Origin::Spawned(child))
+    }
+
+    /// 既存プロセスに attach し、最初の停止まで待ちます。
+    pub fn attach(pid: Pid) -> io::Result<Self> {
+        ptrace::attach(pid)?;
+        Self::new_internal(pid, Origin::Attached)
+    }
+
+    fn new_internal(pid: Pid, origin: Origin) -> io::Result<Self> {
         let mut me = Self {
             pid,
-            _child: child,
+            origin,
+            task: 0,
+            threads: Vec::new(),
+            current_thread: 0,
             breakpoints: HashMap::new(),
             last_status: None,
             at_breakpoint: None,
@@ -94,13 +136,183 @@ impl Debugger {
             at_watchpoint: None,
         };
 
+        // task が未取得の段階では refresh_threads を呼べないので wait() 側でスキップされる
         let status = me.wait()?;
         me.last_status = Some(status);
 
         // exec 停止後に対象バイナリの Mach-O ヘッダからアーキテクチャを検出する
         me.arch = mach::detect_arch(pid)?;
+        me.task = mach::get_task(pid)?;
+        me.refresh_threads()?;
 
         Ok(me)
+    }
+
+    /// 現在選択中スレッドのポートを返します。
+    fn current_thread_port(&self) -> io::Result<MachPort> {
+        self.threads
+            .get(self.current_thread)
+            .map(|t| t.port)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no threads available"))
+    }
+
+    /// タスク内のスレッド一覧を最新化します。
+    /// 新規に見つかったスレッドには既存の HW ブレークポイント/ウォッチポイントを適用し、
+    /// いなくなったスレッドのポートは解放します。tid をキーに `suspended` 状態と
+    /// 現在選択中スレッドを引き継ぎます。
+    fn refresh_threads(&mut self) -> io::Result<()> {
+        let new_ports = mach::list_threads(self.task)?;
+        let old_threads = std::mem::take(&mut self.threads);
+        let current_tid = old_threads.get(self.current_thread).map(|t| t.tid);
+
+        let mut new_entries = Vec::with_capacity(new_ports.len());
+        for port in new_ports {
+            let tid = mach::thread_unique_id(port).unwrap_or(0);
+            let is_new = !old_threads.iter().any(|t| t.tid == tid);
+            let suspended = old_threads
+                .iter()
+                .find(|t| t.tid == tid)
+                .map_or(false, |t| t.suspended);
+            if is_new {
+                self.apply_existing_bp_wp_to_thread(port)?;
+            }
+            new_entries.push(ThreadEntry { port, tid, suspended });
+        }
+
+        for old in old_threads {
+            mach::deallocate_port(old.port);
+        }
+
+        self.current_thread = current_tid
+            .and_then(|tid| new_entries.iter().position(|t| t.tid == tid))
+            .unwrap_or(0);
+        self.threads = new_entries;
+        Ok(())
+    }
+
+    /// 新規発見スレッドに、既存の HW BP / WP スロットを反映します。
+    #[cfg(target_arch = "aarch64")]
+    fn apply_existing_bp_wp_to_thread(&self, port: MachPort) -> io::Result<()> {
+        for (slot, addr) in self.hw_bp_slots.iter().enumerate() {
+            if let Some(addr) = addr {
+                mach::set_hw_breakpoint_slot(port, slot, *addr)?;
+            }
+        }
+        for (slot, info) in self.wp_slots.iter().enumerate() {
+            if let Some(info) = info {
+                mach::set_hw_watchpoint_slot(port, slot, info.addr, info.cond, info.len)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 新規発見スレッドに、既存の HW WP スロットを反映します (x86_64 SW BP はコード側で共有済み)。
+    #[cfg(target_arch = "x86_64")]
+    fn apply_existing_bp_wp_to_thread(&self, port: MachPort) -> io::Result<()> {
+        for (slot, info) in self.wp_slots.iter().enumerate() {
+            if let Some(info) = info {
+                mach::set_watchpoint_slot(port, slot, info.addr, info.cond, info.len)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 現在選択中スレッドの (インデックス, tid) を返します。
+    pub fn current_thread(&self) -> Option<(usize, u64)> {
+        self.threads.get(self.current_thread).map(|t| (self.current_thread, t.tid))
+    }
+
+    /// 現在のスレッド一覧のスナップショットを返します(表示用)。
+    pub fn threads(&self) -> Vec<ThreadSummary> {
+        self.threads
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ThreadSummary {
+                index: i,
+                tid: t.tid,
+                pc: mach::get_registers(t.port).ok().map(|r| r.pc()),
+                suspended: t.suspended,
+                current: i == self.current_thread,
+            })
+            .collect()
+    }
+
+    /// レジスタ操作・ステップ実行の対象スレッドを切り替えます。
+    pub fn select_thread(&mut self, idx: usize) -> io::Result<()> {
+        if idx >= self.threads.len() {
+            return Err(io::Error::new(io::ErrorKind::Other, "invalid thread index"));
+        }
+        self.current_thread = idx;
+        Ok(())
+    }
+
+    /// 指定スレッドを Mach レベルで一時停止します。
+    /// `cont()`/`step()` でプロセス全体を再開しても、このスレッドだけは止まったままになります。
+    pub fn suspend_thread(&mut self, idx: usize) -> io::Result<()> {
+        let port = self
+            .threads
+            .get(idx)
+            .map(|t| t.port)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid thread index"))?;
+        mach::suspend_thread(port)?;
+        self.threads[idx].suspended = true;
+        Ok(())
+    }
+
+    /// `suspend_thread` で止めたスレッドを再開します。
+    pub fn resume_thread(&mut self, idx: usize) -> io::Result<()> {
+        let port = self
+            .threads
+            .get(idx)
+            .map(|t| t.port)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid thread index"))?;
+        mach::resume_thread(port)?;
+        self.threads[idx].suspended = false;
+        Ok(())
+    }
+
+    /// 現在選択中スレッドだけを1命令進めます。
+    ///
+    /// macOS の `ptrace(PT_STEP)` はマルチスレッドプロセスでは SIGTRAP を返さず
+    /// `wait()` が無期限にブロックすることを確認した (他スレッドを Mach レベルで
+    /// suspend しても解消しない既知の ptrace 実装上の制約)。そのため実績のある
+    /// 「ブレークポイント + PT_CONTINUE」の仕組みを再利用し、次に実行されうる
+    /// アドレスに一時ブレークポイントを置いて1命令だけ進める。
+    /// (x86_64: `disasm::step_targets` で jmp/call/jcc の分岐先も候補に含める。
+    ///  aarch64: 命令長が固定 4 バイトなので pc+4 のみを候補とする — ただし
+    ///  分岐命令をまたぐ場合は直後アドレスに到達しないことがある既知の制限。)
+    fn step_current_thread(&mut self) -> io::Result<WaitStatus> {
+        let keep_port = self.current_thread_port()?;
+        let pc = mach::get_registers(keep_port)?.pc() as usize;
+        let code = self.read_memory(pc, 16).unwrap_or_default();
+
+        #[cfg(target_arch = "x86_64")]
+        let candidates: Vec<usize> = crate::disasm::step_targets(&code, pc as u64);
+        #[cfg(target_arch = "aarch64")]
+        let candidates: Vec<usize> = {
+            let _ = &code;
+            vec![pc + 4]
+        };
+
+        // 既存のユーザーブレークポイントと重複しない候補にだけ一時 BP を置く
+        let mut installed = Vec::new();
+        for &addr in &candidates {
+            let already_armed = self.breakpoints.get(&addr).map_or(false, |b| b.is_enabled());
+            if !already_armed && self.set_breakpoint(addr).is_ok() {
+                installed.push(addr);
+            }
+        }
+
+        ptrace::cont(self.pid)?;
+        let status = self.wait()?;
+        self.last_status = Some(status);
+        self.handle_breakpoint_hit()?;
+
+        for addr in installed {
+            let _ = self.remove_breakpoint(addr);
+        }
+
+        Ok(self.last_status.unwrap())
     }
 
     /// 子プロセスを 1 ステップ実行します。
@@ -108,9 +320,7 @@ impl Debugger {
         if let Some(addr) = self.at_breakpoint.take() {
             self.step_over_breakpoint(addr)?;
         } else {
-            ptrace::step(self.pid)?;
-            let status = self.wait()?;
-            self.last_status = Some(status);
+            self.step_current_thread()?;
         }
         // ステップ先がブレークポイントの先頭に着地した場合を記録
         if let Ok(pc) = self.pc() {
@@ -247,16 +457,20 @@ impl Debugger {
     /// 空きスロットを動的に割り当てて一時 BP を設定します。
     #[cfg(target_arch = "aarch64")]
     fn finish_with_hw_bp(&mut self, ret_addr: usize) -> io::Result<WaitStatus> {
-        // 空きスロットに一時 HW BP を設定
+        // 空きスロットに一時 HW BP を設定 (全スレッドに反映)
         let finish_slot = self.alloc_hw_slot(ret_addr)?;
-        mach::set_hw_breakpoint_slot(self.pid, finish_slot, ret_addr)?;
+        for t in &self.threads {
+            mach::set_hw_breakpoint_slot(t.port, finish_slot, ret_addr)?;
+        }
 
         // ユーザー HW BP に止まっている場合はステップオーバーしてから continue
         if let Some(addr) = self.at_breakpoint.take() {
             self.step_over_breakpoint(addr)?;
             if !matches!(self.last_status, Some(WaitStatus::Stopped { .. })) {
                 // ステップ中にプロセスが終了
-                let _ = mach::clear_hw_breakpoint_slot(self.pid, finish_slot);
+                for t in &self.threads {
+                    let _ = mach::clear_hw_breakpoint_slot(t.port, finish_slot);
+                }
                 self.release_hw_slot(finish_slot);
                 return Ok(self.last_status.unwrap());
             }
@@ -267,8 +481,10 @@ impl Debugger {
         let status = self.wait()?;
         self.last_status = Some(status);
 
-        // finish HW BP をクリアしてスロットを解放
-        let _ = mach::clear_hw_breakpoint_slot(self.pid, finish_slot);
+        // finish HW BP をクリアしてスロットを解放 (refresh_threads 後の最新スレッド集合に対して)
+        for t in &self.threads {
+            let _ = mach::clear_hw_breakpoint_slot(t.port, finish_slot);
+        }
         self.release_hw_slot(finish_slot);
 
         // ユーザー HW BP ヒット判定
@@ -334,13 +550,15 @@ impl Debugger {
     }
 
     /// ブレークポイントを設定します。
-    /// ARM64: コードを書かずにハードウェア BP (BVR/BCR) を使用します。
-    /// x86_64: int3 をコードに書き込みます。
+    /// ARM64: コードを書かずにハードウェア BP (BVR/BCR) を全スレッドに使用します。
+    /// x86_64: int3 をコードに書き込みます (アドレス空間共有のため全スレッドに自動適用)。
     pub fn set_breakpoint(&mut self, addr: usize) -> io::Result<()> {
         #[cfg(target_arch = "aarch64")]
         {
             let slot = self.alloc_hw_slot(addr)?;
-            mach::set_hw_breakpoint_slot(self.pid, slot, addr)?;
+            for t in &self.threads {
+                mach::set_hw_breakpoint_slot(t.port, slot, addr)?;
+            }
             let bp = Breakpoint::new_hw_enabled(addr, self.arch);
             self.breakpoints.insert(addr, bp);
             return Ok(());
@@ -391,7 +609,7 @@ impl Debugger {
         addrs
     }
 
-    /// ウォッチポイントを設定します (x86_64 のみ、スロット 0〜3)。
+    /// ウォッチポイントを設定します (x86_64 のみ、スロット 0〜3、全スレッドに適用)。
     #[cfg(target_arch = "x86_64")]
     pub fn set_watchpoint(
         &mut self,
@@ -416,7 +634,9 @@ impl Debugger {
                     "watchpoint slots exhausted (max 4 on x86_64)",
                 )
             })?;
-        mach::set_watchpoint_slot(self.pid, slot, addr, cond, len)?;
+        for t in &self.threads {
+            mach::set_watchpoint_slot(t.port, slot, addr, cond, len)?;
+        }
         self.wp_slots[slot] = Some(WatchpointInfo { addr, cond, len });
         Ok(slot)
     }
@@ -427,7 +647,9 @@ impl Debugger {
         if slot >= 4 {
             return Err(io::Error::new(io::ErrorKind::Other, "invalid watchpoint slot"));
         }
-        mach::clear_watchpoint_slot(self.pid, slot)?;
+        for t in &self.threads {
+            mach::clear_watchpoint_slot(t.port, slot)?;
+        }
         self.wp_slots[slot] = None;
         Ok(())
     }
@@ -448,7 +670,7 @@ impl Debugger {
         self.at_watchpoint
     }
 
-    /// ウォッチポイントを設定します (ARM64 のみ、スロット 0〜3、WVR/WCR ベース)。
+    /// ウォッチポイントを設定します (ARM64 のみ、スロット 0〜3、WVR/WCR ベース、全スレッドに適用)。
     #[cfg(target_arch = "aarch64")]
     pub fn set_watchpoint(
         &mut self,
@@ -474,7 +696,9 @@ impl Debugger {
                 )
             })?;
         let prev = self.read_memory(addr, len.as_bytes()).unwrap_or_default();
-        mach::set_hw_watchpoint_slot(self.pid, slot, addr, cond, len)?;
+        for t in &self.threads {
+            mach::set_hw_watchpoint_slot(t.port, slot, addr, cond, len)?;
+        }
         self.wp_slots[slot] = Some(WatchpointInfo { addr, cond, len, prev_value: prev });
         Ok(slot)
     }
@@ -485,7 +709,9 @@ impl Debugger {
         if slot >= 4 {
             return Err(io::Error::new(io::ErrorKind::Other, "invalid watchpoint slot"));
         }
-        mach::clear_hw_watchpoint_slot(self.pid, slot)?;
+        for t in &self.threads {
+            mach::clear_hw_watchpoint_slot(t.port, slot)?;
+        }
         self.wp_slots[slot] = None;
         Ok(())
     }
@@ -511,7 +737,9 @@ impl Debugger {
         #[cfg(target_arch = "aarch64")]
         {
             if let Some(slot) = self.find_hw_slot(addr) {
-                mach::clear_hw_breakpoint_slot(self.pid, slot)?;
+                for t in &self.threads {
+                    mach::clear_hw_breakpoint_slot(t.port, slot)?;
+                }
                 self.hw_bp_slots[slot] = None;
             }
             self.breakpoints.remove(&addr);
@@ -533,41 +761,41 @@ impl Debugger {
         }
     }
 
-    /// 汎用レジスタを取得します。
+    /// 汎用レジスタを取得します (現在選択中スレッド)。
     pub fn registers(&self) -> io::Result<ThreadState64> {
-        mach::get_registers(self.pid)
+        mach::get_registers(self.current_thread_port()?)
     }
 
-    /// 浮動小数点レジスタを取得します (x86_64 のみ)。
+    /// 浮動小数点レジスタを取得します (x86_64 のみ、現在選択中スレッド)。
     #[cfg(target_arch = "x86_64")]
     pub fn float_registers(&self) -> io::Result<FloatState64> {
-        mach::get_float_registers(self.pid)
+        mach::get_float_registers(self.current_thread_port()?)
     }
 
-    /// 浮動小数点レジスタを設定します (x86_64 のみ)。
+    /// 浮動小数点レジスタを設定します (x86_64 のみ、現在選択中スレッド)。
     #[cfg(target_arch = "x86_64")]
     pub fn set_float_registers(&self, state: &FloatState64) -> io::Result<()> {
-        mach::set_float_registers(self.pid, state)
+        mach::set_float_registers(self.current_thread_port()?, state)
     }
 
-    /// NEON/FP レジスタを取得します (ARM64 のみ)。
+    /// NEON/FP レジスタを取得します (ARM64 のみ、現在選択中スレッド)。
     #[cfg(target_arch = "aarch64")]
     pub fn float_registers(&self) -> io::Result<ArmNeonState64> {
-        mach::get_float_registers(self.pid)
+        mach::get_float_registers(self.current_thread_port()?)
     }
 
-    /// NEON/FP レジスタを設定します (ARM64 のみ)。
+    /// NEON/FP レジスタを設定します (ARM64 のみ、現在選択中スレッド)。
     #[cfg(target_arch = "aarch64")]
     pub fn set_float_registers(&self, state: &ArmNeonState64) -> io::Result<()> {
-        mach::set_float_registers(self.pid, state)
+        mach::set_float_registers(self.current_thread_port()?, state)
     }
 
-    /// 汎用レジスタを設定します。
+    /// 汎用レジスタを設定します (現在選択中スレッド)。
     pub fn set_registers(&self, regs: &ThreadState64) -> io::Result<()> {
-        mach::set_registers(self.pid, regs)
+        mach::set_registers(self.current_thread_port()?, regs)
     }
 
-    /// プログラムカウンタを取得します。
+    /// プログラムカウンタを取得します (現在選択中スレッド)。
     pub fn pc(&self) -> io::Result<u64> {
         self.registers().map(|r| r.pc())
     }
@@ -622,10 +850,24 @@ impl Debugger {
         ptrace::kill(self.pid)
     }
 
-    /// 子プロセスをデタッチします。
-    #[allow(dead_code)]
+    /// 子プロセスをデタッチします (プロセス自体は動作を継続します)。
     pub fn detach(&self) -> io::Result<()> {
-        ptrace::detach(self.pid)
+        ptrace::detach(self.pid)?;
+        // detach 成功後は task/スレッドポートへの送信権を解放する
+        // (失敗時は保持したままにして、セッションを引き続き操作可能にする)
+        for t in &self.threads {
+            mach::deallocate_port(t.port);
+        }
+        mach::deallocate_port(self.task);
+        Ok(())
+    }
+
+    /// 起動経緯に応じて後始末します: spawn したプロセスは kill、attach したプロセスは detach。
+    pub fn shutdown(&self) -> io::Result<()> {
+        match self.origin {
+            Origin::Spawned(_) => self.kill(),
+            Origin::Attached => self.detach(),
+        }
     }
 
     /// 現在の停止状態を取得します。
@@ -638,21 +880,38 @@ impl Debugger {
         self.at_breakpoint.is_some()
     }
 
-    /// PT_CONTINUE 後の停止がブレークポイントヒットか判定し、
-    /// ヒットしていたら PC を BP 先頭に巻き戻して記録します。
+    /// PT_CONTINUE 後の停止がブレークポイントヒットか判定します。
+    /// 全スレッドの PC を走査してヒットしたスレッドを特定し、そのスレッドを
+    /// 自動的に current にした上で PC を BP 先頭に巻き戻します。
     /// x86_64: int3 実行後 PC は BP アドレス + 1 → 1 引く
     /// aarch64: brk #0 後 PC は BP アドレスのまま → 補正不要
+    /// x86_64 では複数スレッドが同じ int3 に同時にトラップすることがある。
+    /// 補正されないまま残った thread は元命令の途中 (bp_addr+1) から実行を
+    /// 再開してしまい、命令ストリームが破損する。そのため見つかった最初の
+    /// 1 本を current/at_breakpoint として選ぶだけでなく、該当する全スレッドの
+    /// PC を bp_addr まで巻き戻す。
     fn handle_breakpoint_hit(&mut self) -> io::Result<()> {
-        if let Some(WaitStatus::Stopped { signal, pc }) = self.last_status {
+        if let Some(WaitStatus::Stopped { signal, .. }) = self.last_status {
             if signal != libc::SIGTRAP {
                 return Ok(());
             }
-            let bp_addr = (pc as usize).wrapping_sub(self.arch.bp_pc_offset());
-            if self.breakpoints.get(&bp_addr).map_or(false, |b| b.is_enabled()) {
-                let mut regs = self.registers()?;
-                regs.set_pc(bp_addr as u64);
-                mach::set_registers(self.pid, &regs)?;
+            let mut hit: Option<(usize, usize)> = None; // (thread index, bp_addr)
+            for i in 0..self.threads.len() {
+                let port = self.threads[i].port;
+                let Ok(mut regs) = mach::get_registers(port) else { continue };
+                let pc = regs.pc() as usize;
+                let bp_addr = pc.wrapping_sub(self.arch.bp_pc_offset());
+                if self.breakpoints.get(&bp_addr).map_or(false, |b| b.is_enabled()) {
+                    regs.set_pc(bp_addr as u64);
+                    mach::set_registers(port, &regs)?;
+                    if hit.is_none() {
+                        hit = Some((i, bp_addr));
+                    }
+                }
+            }
+            if let Some((i, bp_addr)) = hit {
                 self.at_breakpoint = Some(bp_addr);
+                self.current_thread = i;
                 self.last_status = Some(WaitStatus::Stopped {
                     signal,
                     pc: bp_addr as u64,
@@ -663,6 +922,7 @@ impl Debugger {
     }
 
     /// DR6 を読んでウォッチポイントヒットを記録します (x86_64 のみ)。
+    /// DR6 はスレッドごとのレジスタなので全スレッドを走査します。
     #[cfg(target_arch = "x86_64")]
     fn handle_watchpoint_hit(&mut self) -> io::Result<()> {
         self.at_watchpoint = None;
@@ -675,10 +935,15 @@ impl Debugger {
             if self.at_breakpoint.is_some() {
                 return Ok(());
             }
-            let hits = mach::watchpoint_hit_slots(self.pid)?;
-            if let Some(&slot) = hits.first() {
-                if let Some(info) = &self.wp_slots[slot] {
-                    self.at_watchpoint = Some(info.addr);
+            for i in 0..self.threads.len() {
+                let port = self.threads[i].port;
+                let hits = mach::watchpoint_hit_slots(port)?;
+                if let Some(&slot) = hits.first() {
+                    if let Some(info) = &self.wp_slots[slot] {
+                        self.at_watchpoint = Some(info.addr);
+                        self.current_thread = i;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -688,7 +953,7 @@ impl Debugger {
     /// ウォッチポイントヒットを記録します (ARM64 のみ)。
     /// ARM64 には DR6 相当のヒットスロット通知 (ESR_EL1) がユーザ空間 (ptrace) から
     /// 取得できないため、各スロットの監視先メモリを前回値と比較して変化した
-    /// スロットをヒットとみなします。
+    /// スロットをヒットとみなします(プロセス共有メモリなのでスレッドに依存しません)。
     #[cfg(target_arch = "aarch64")]
     fn handle_watchpoint_hit(&mut self) -> io::Result<()> {
         self.at_watchpoint = None;
@@ -722,7 +987,7 @@ impl Debugger {
     }
 
     /// ブレークポイントを「踏み越え」て 1 命令実行し、BP を再設定します。
-    /// ARM64: HW BP を一時無効化 → ステップ → 再有効化 (コード書き込み不要)
+    /// ARM64: HW BP を一時無効化 (全スレッド) → ステップ → 再有効化 (コード書き込み不要)
     /// x86_64: SW BP を無効化 → ステップ → 再有効化
     fn step_over_breakpoint(&mut self, addr: usize) -> io::Result<()> {
         #[cfg(target_arch = "aarch64")]
@@ -733,14 +998,15 @@ impl Debugger {
                     format!("no HW BP slot for {:#x}", addr),
                 )
             })?;
-            // HW BP を一時的に無効化
-            mach::clear_hw_breakpoint_slot(self.pid, slot)?;
-            // PC は ARM64 では補正不要 (bp_pc_offset = 0)
-            ptrace::step(self.pid)?;
-            let status = self.wait()?;
-            self.last_status = Some(status);
-            // HW BP を再有効化
-            mach::set_hw_breakpoint_slot(self.pid, slot, addr)?;
+            // HW BP を一時的に無効化 (全スレッド)
+            for t in &self.threads {
+                mach::clear_hw_breakpoint_slot(t.port, slot)?;
+            }
+            self.step_current_thread()?;
+            // HW BP を再有効化 (refresh_threads 後の最新スレッド集合に対して)
+            for t in &self.threads {
+                mach::set_hw_breakpoint_slot(t.port, slot, addr)?;
+            }
             return Ok(());
         }
 
@@ -756,11 +1022,10 @@ impl Debugger {
             // PC を BP 先頭に戻してステップ実行
             let mut regs = self.registers()?;
             regs.set_pc(addr as u64);
-            mach::set_registers(self.pid, &regs)?;
+            let keep_port = self.current_thread_port()?;
+            mach::set_registers(keep_port, &regs)?;
 
-            ptrace::step(self.pid)?;
-            let status = self.wait()?;
-            self.last_status = Some(status);
+            self.step_current_thread()?;
 
             bp.re_enable(self.pid)?;
             self.breakpoints.insert(addr, bp);
@@ -769,6 +1034,8 @@ impl Debugger {
     }
 
     /// waitpid し、停止/終了/シグナル状態を判定します。
+    /// プロセスが停止した場合は `refresh_threads` でスレッド一覧を最新化します
+    /// (構築直後で task が未取得の間はスキップされます)。
     fn wait(&mut self) -> io::Result<WaitStatus> {
         let mut status: i32 = 0;
         loop {
@@ -784,9 +1051,14 @@ impl Debugger {
             break;
         }
 
+        let stopped = (status & 0x7f) == 0x7f;
+        if stopped && self.task != 0 {
+            let _ = self.refresh_threads();
+        }
+
         let pc = self.pc().unwrap_or(0);
 
-        let s = if (status & 0x7f) == 0x7f {
+        let s = if stopped {
             WaitStatus::Stopped {
                 signal: (status >> 8) & 0xff,
                 pc,

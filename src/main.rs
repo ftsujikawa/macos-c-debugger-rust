@@ -44,6 +44,99 @@ struct SoftWatchpoint {
     prev_value: Vec<u8>,
 }
 
+/// デバッグ対象1プロセス分の状態。複数プロセスを同時に扱えるよう
+/// REPL のループ変数を1つの構造体にまとめたもの。
+struct Session {
+    dbg: Debugger,
+    program: String,
+    base: Option<u64>,
+    syms: Option<Symbols>,
+    leak_tracker: Option<LeakTracker>,
+    soft_watches: Vec<SoftWatchpoint>,
+    next_sw_id: usize,
+}
+
+/// シンボル/行番号情報を読み込みます (見つからなくても警告だけで続行)。
+fn load_symbols(program: &str) -> Option<Symbols> {
+    match Symbols::load(program) {
+        Ok(s) => {
+            println!(
+                "Loaded {} symbols, {} line table entries",
+                s.symbol_count(),
+                s.line_row_count()
+            );
+            if s.line_row_count() == 0 {
+                eprintln!(
+                    "warning: no line info; run `dsymutil {}` to generate a dSYM",
+                    program
+                );
+            }
+            Some(s)
+        }
+        Err(e) => {
+            eprintln!("warning: failed to load symbols: {}", e);
+            None
+        }
+    }
+}
+
+/// プログラムを新しい子プロセスとして起動し、新規セッションを作ります。
+fn spawn_session(program: &str, args: &[String]) -> io::Result<Session> {
+    println!("Starting: {} {:?}", program, args);
+    let dbg = Debugger::new(program, args)?;
+    println!("Process started. pid={}", dbg.pid);
+    print_status(&dbg, dbg.last_status().unwrap());
+    let syms = load_symbols(program);
+    Ok(Session {
+        dbg,
+        program: program.to_string(),
+        base: None,
+        syms,
+        leak_tracker: None,
+        soft_watches: Vec::new(),
+        next_sw_id: 0,
+    })
+}
+
+/// 既存プロセスに attach し、新規セッションを作ります。
+/// `program` を指定するとシンボル/行番号情報もあわせて読み込みます。
+fn attach_session(pid: libc::pid_t, program: Option<&str>) -> io::Result<Session> {
+    let dbg = Debugger::attach(pid)?;
+    println!("Attached. pid={}", dbg.pid);
+    print_status(&dbg, dbg.last_status().unwrap());
+    let syms = program.and_then(load_symbols);
+    Ok(Session {
+        dbg,
+        program: program.unwrap_or("<attached>").to_string(),
+        base: None,
+        syms,
+        leak_tracker: None,
+        soft_watches: Vec::new(),
+        next_sw_id: 0,
+    })
+}
+
+/// pid からセッションのインデックスを探します。
+fn select_session(sessions: &[Session], pid_str: &str) -> Option<usize> {
+    let target: libc::pid_t = pid_str.parse().ok()?;
+    sessions.iter().position(|sess| sess.dbg.pid == target)
+}
+
+/// セッションを一覧から取り除き、`current` を安全な値に調整します。
+fn remove_session(sessions: &mut Vec<Session>, current: &mut usize, idx: usize) {
+    sessions.remove(idx);
+    if sessions.is_empty() {
+        *current = 0;
+        return;
+    }
+    if idx < *current {
+        *current -= 1;
+    } else if *current >= sessions.len() {
+        *current = sessions.len() - 1;
+    }
+    CHILD_PID.store(sessions[*current].dbg.pid, Ordering::Relaxed);
+}
+
 /// バイト列を u64 に変換します（リトルエンディアン、最大 8 バイト）。
 fn bytes_to_u64(b: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
@@ -765,19 +858,25 @@ fn show_command(
     }
 }
 
-fn print_status(status: WaitStatus) {
+fn print_status(dbg: &Debugger, status: WaitStatus) {
     match status {
         WaitStatus::Stopped { signal, pc } => {
-            println!("Stopped: signal={} pc={:#018x}", signal, pc);
+            match dbg.current_thread() {
+                Some((idx, tid)) => println!(
+                    "Stopped: pid={} thread=#{} tid={:#x} signal={} pc={:#018x}",
+                    dbg.pid, idx, tid, signal, pc
+                ),
+                None => println!("Stopped: pid={} signal={} pc={:#018x}", dbg.pid, signal, pc),
+            }
         }
         WaitStatus::Exited { code } => {
-            println!("Exited: code={}", code);
+            println!("Exited: pid={} code={}", dbg.pid, code);
         }
         WaitStatus::Signaled { signal } => {
-            println!("Signaled: signal={}", signal);
+            println!("Signaled: pid={} signal={}", dbg.pid, signal);
         }
         WaitStatus::Unknown { status } => {
-            println!("Unknown status: {}", status);
+            println!("Unknown status: pid={} {}", dbg.pid, status);
         }
     }
 }
@@ -792,50 +891,26 @@ fn main() -> io::Result<()> {
     let program = args.remove(0);
     let dbg_args = args;
 
-    println!("Starting: {} {:?}", program, dbg_args);
-    let mut dbg = Debugger::new(&program, &dbg_args)?;
-    println!("Process started. pid={}", dbg.pid);
-    print_status(dbg.last_status().unwrap());
+    let mut sessions: Vec<Session> = vec![spawn_session(&program, &dbg_args)?];
+    let mut current: usize = 0;
 
     // SIGINTを子プロセスへ転送するハンドラを設定
-    CHILD_PID.store(dbg.pid, Ordering::Relaxed);
+    CHILD_PID.store(sessions[current].dbg.pid, Ordering::Relaxed);
     setup_sigint_handler();
-
-    let mut base = dbg.image_base().ok();
-    let syms = match Symbols::load(&program) {
-        Ok(s) => {
-            println!(
-                "Loaded {} symbols, {} line table entries",
-                s.symbol_count(),
-                s.line_row_count()
-            );
-            if s.line_row_count() == 0 {
-                eprintln!(
-                    "warning: no line info; run `dsymutil {}` to generate a dSYM",
-                    program
-                );
-            }
-            Some(s)
-        }
-        Err(e) => {
-            eprintln!("warning: failed to load symbols: {}", e);
-            None
-        }
-    };
 
     let stdin = io::stdin();
     let mut line = String::new();
-    let mut leak_tracker: Option<LeakTracker> = None;
-    let mut soft_watches: Vec<SoftWatchpoint> = Vec::new();
-    let mut next_sw_id: usize = 0;
 
     loop {
         // 起動直後は task_for_pid が未準備で失敗することがあるため、
         // base が取れていないときはコマンドごとに再取得を試みる
-        if base.is_none() {
-            base = dbg.image_base().ok();
-            if base.is_some() {
-                println!("image base: {:#018x}", base.unwrap());
+        {
+            let sess = &mut sessions[current];
+            if sess.base.is_none() {
+                sess.base = sess.dbg.image_base().ok();
+                if let Some(b) = sess.base {
+                    println!("image base: {:#018x}", b);
+                }
             }
         }
 
@@ -850,6 +925,168 @@ fn main() -> io::Result<()> {
         if parts.is_empty() {
             continue;
         }
+
+        // セッション管理コマンド (dbg などの借用より前に処理する)
+        match parts[0] {
+            "attach" => {
+                let Some(pid_str) = parts.get(1) else {
+                    eprintln!("usage: attach <pid> [program-path-for-symbols]");
+                    continue;
+                };
+                let pid: libc::pid_t = match pid_str.parse() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("attach: invalid pid '{}'", pid_str);
+                        continue;
+                    }
+                };
+                match attach_session(pid, parts.get(2).copied()) {
+                    Ok(sess) => {
+                        sessions.push(sess);
+                        current = sessions.len() - 1;
+                        CHILD_PID.store(sessions[current].dbg.pid, Ordering::Relaxed);
+                        println!(
+                            "Attached as session #{} (pid={})",
+                            current, sessions[current].dbg.pid
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("attach: {}", e);
+                        eprintln!(
+                            "  hint: macOS では自分が fork した子プロセス以外への attach は\n\
+                             \x20 root 権限が必要になることがあります (例: sudo で本デバッガを起動)。"
+                        );
+                    }
+                }
+                continue;
+            }
+            "spawn" => {
+                if parts.len() < 2 {
+                    eprintln!("usage: spawn <program> [args...]");
+                    continue;
+                }
+                let prog = parts[1].to_string();
+                let prog_args: Vec<String> = parts[2..].iter().map(|s| s.to_string()).collect();
+                match spawn_session(&prog, &prog_args) {
+                    Ok(sess) => {
+                        sessions.push(sess);
+                        current = sessions.len() - 1;
+                        CHILD_PID.store(sessions[current].dbg.pid, Ordering::Relaxed);
+                        println!(
+                            "Started as session #{} (pid={})",
+                            current, sessions[current].dbg.pid
+                        );
+                    }
+                    Err(e) => eprintln!("spawn: {}", e),
+                }
+                continue;
+            }
+            "process" => {
+                match parts.get(1).copied().unwrap_or("list") {
+                    "list" => {
+                        for (i, sess) in sessions.iter().enumerate() {
+                            let marker = if i == current { "*" } else { " " };
+                            let status = match sess.dbg.last_status() {
+                                Some(WaitStatus::Exited { code }) => format!("exited({})", code),
+                                Some(WaitStatus::Signaled { signal }) => format!("signaled({})", signal),
+                                _ => "stopped".to_string(),
+                            };
+                            println!(
+                                "{} #{} pid={} threads={} [{}]  {}",
+                                marker,
+                                i,
+                                sess.dbg.pid,
+                                sess.dbg.threads().len(),
+                                status,
+                                sess.program
+                            );
+                        }
+                    }
+                    "select" => {
+                        let Some(pid_str) = parts.get(2) else {
+                            eprintln!("usage: process select <pid>");
+                            continue;
+                        };
+                        match select_session(&sessions, pid_str) {
+                            Some(idx) => {
+                                current = idx;
+                                CHILD_PID.store(sessions[current].dbg.pid, Ordering::Relaxed);
+                                println!(
+                                    "current session: #{} (pid={})",
+                                    current, sessions[current].dbg.pid
+                                );
+                            }
+                            None => eprintln!("process select: no such pid '{}'", pid_str),
+                        }
+                    }
+                    _ => eprintln!("usage: process [list | select <pid>]"),
+                }
+                continue;
+            }
+            "detach" => {
+                let idx = match parts.get(1) {
+                    Some(s) => select_session(&sessions, s),
+                    None => Some(current),
+                };
+                match idx {
+                    Some(idx) => {
+                        if let Err(e) = sessions[idx].dbg.detach() {
+                            eprintln!("detach: {}", e);
+                            eprintln!(
+                                "  hint: 環境によっては PT_DETACH が失敗することがあります。\n\
+                                 \x20 プロセスを終了してよいなら 'kill' を使ってください。"
+                            );
+                        } else {
+                            println!(
+                                "Detached session #{} (pid={}); process left running.",
+                                idx, sessions[idx].dbg.pid
+                            );
+                            remove_session(&mut sessions, &mut current, idx);
+                            if sessions.is_empty() {
+                                println!("No sessions left.");
+                                break;
+                            }
+                        }
+                    }
+                    None => eprintln!("detach: no such session"),
+                }
+                continue;
+            }
+            "kill" => {
+                let idx = match parts.get(1) {
+                    Some(s) => select_session(&sessions, s),
+                    None => Some(current),
+                };
+                match idx {
+                    Some(idx) => {
+                        let pid = sessions[idx].dbg.pid;
+                        if let Err(e) = sessions[idx].dbg.kill() {
+                            eprintln!("kill: {}", e);
+                        } else {
+                            println!("Killed session #{} (pid={}).", idx, pid);
+                            remove_session(&mut sessions, &mut current, idx);
+                            if sessions.is_empty() {
+                                println!("No sessions left.");
+                                break;
+                            }
+                        }
+                    }
+                    None => eprintln!("kill: no such session"),
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        // 以降は現在選択中セッションに対する通常コマンド
+        let sess = &mut sessions[current];
+        let dbg = &mut sess.dbg;
+        let base = sess.base;
+        let syms = sess.syms.as_ref();
+        let leak_tracker = &mut sess.leak_tracker;
+        let soft_watches = &mut sess.soft_watches;
+        let next_sw_id = &mut sess.next_sw_id;
+        let program = sess.program.as_str();
 
         match parts[0] {
             "h" | "help" => {
@@ -884,15 +1121,24 @@ fn main() -> io::Result<()> {
                 println!("  leaks on|off                 enable/disable heap leak tracking");
                 println!("  leaks show / show leaks      show live (possibly leaked) allocations");
                 println!("  base                         show main executable load address");
-                println!("  q, quit, exit                quit");
+                println!("  threads, thread list         list threads in the current process");
+                println!("  thread select <idx>          switch register/step focus to thread <idx>");
+                println!("  thread suspend|resume <idx>  suspend/resume a single thread (Mach-level)");
+                println!("  attach <pid> [program]       attach to an existing process (new session)");
+                println!("  spawn <program> [args...]    launch another process (new session)");
+                println!("  process list                 list attached/spawned sessions");
+                println!("  process select <pid>         switch current session");
+                println!("  detach [pid]                 detach a session (process keeps running)");
+                println!("  kill [pid]                   kill a session's process");
+                println!("  q, quit, exit                quit (spawned processes killed, attached ones detached)");
             }
             "b" | "break" => {
                 if parts.len() < 2 {
                     eprintln!("usage: b <addr | base+off | symbol | file:line>");
                     continue;
                 }
-                let cur_file = current_line(&dbg, base, syms.as_ref()).map(|(f, _)| f);
-                match resolve_location(parts[1], base, syms.as_ref(), cur_file.as_deref()) {
+                let cur_file = current_line(dbg, base, syms).map(|(f, _)| f);
+                match resolve_location(parts[1], base, syms, cur_file.as_deref()) {
                     Ok(addr) => {
                         // シンボル名指定のとき、プロローグをスキップした位置に設定する
                         // (DWARF に行情報がない場合のフォールバックとして命令バイトで判定)
@@ -978,12 +1224,12 @@ fn main() -> io::Result<()> {
                 }
                 // 変数名ならアドレスを解決、それ以外は数値アドレス式として評価
                 let addr: usize = if is_identifier(parts[1]) {
-                    match resolve_variable(&dbg, base, syms.as_ref(), parts[1]) {
+                    match resolve_variable(dbg, base, syms, parts[1]) {
                         Ok((a, _)) => a as usize,
                         Err(_) => {
                             // 変数として解決できなければ数値アドレス式として試みる
                             match parse_addr(parts[1], base)
-                                .or_else(|| eval_expression(&dbg, base, syms.as_ref(), parts[1]).ok().map(|v| v as usize))
+                                .or_else(|| eval_expression(dbg, base, syms, parts[1]).ok().map(|v| v as usize))
                             {
                                 Some(a) => a,
                                 None => {
@@ -995,7 +1241,7 @@ fn main() -> io::Result<()> {
                     }
                 } else {
                     match parse_addr(parts[1], base)
-                        .or_else(|| eval_expression(&dbg, base, syms.as_ref(), parts[1]).ok().map(|v| v as usize))
+                        .or_else(|| eval_expression(dbg, base, syms, parts[1]).ok().map(|v| v as usize))
                     {
                         Some(a) => a,
                         None => {
@@ -1023,8 +1269,8 @@ fn main() -> io::Result<()> {
                         // ハードウェアウォッチポイントが使えない環境 (Rosetta 2 等)
                         // → ソフトウェアウォッチポイントにフォールバック
                         let prev = dbg.read_memory(addr, size).unwrap_or_default();
-                        let id = next_sw_id;
-                        next_sw_id += 1;
+                        let id = *next_sw_id;
+                        *next_sw_id += 1;
                         soft_watches.push(SoftWatchpoint {
                             id,
                             addr,
@@ -1043,53 +1289,53 @@ fn main() -> io::Result<()> {
                 CHILD_RUNNING.store(true, Ordering::SeqCst);
                 let status = if !soft_watches.is_empty() {
                     // ソフトウェアウォッチポイントが有効 → シングルステップループ
-                    soft_watch_cont(&mut dbg, &mut soft_watches)?
+                    soft_watch_cont(dbg, soft_watches)?
                 } else {
                     let raw = dbg.cont()?;
-                    auto_cont(&mut dbg, &mut leak_tracker, raw)?
+                    auto_cont(dbg, leak_tracker, raw)?
                 };
                 CHILD_RUNNING.store(false, Ordering::SeqCst);
-                print_status(status);
+                print_status(dbg, status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
                 if let Some(wp_addr) = dbg.at_watchpoint() {
                     println!("Hardware watchpoint hit at {:#018x}", wp_addr);
                 }
-                show_context(&dbg, base, syms.as_ref());
+                show_context(dbg, base, syms);
             }
             "s" | "step" => {
                 CHILD_RUNNING.store(true, Ordering::SeqCst);
-                let status = step_line(&mut dbg, base, syms.as_ref())?;
+                let status = step_line(dbg, base, syms)?;
                 CHILD_RUNNING.store(false, Ordering::SeqCst);
-                print_status(status);
+                print_status(dbg, status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
-                check_soft_watches(&dbg, &mut soft_watches);
-                show_context(&dbg, base, syms.as_ref());
+                check_soft_watches(dbg, soft_watches);
+                show_context(dbg, base, syms);
             }
             "n" | "next" => {
                 CHILD_RUNNING.store(true, Ordering::SeqCst);
-                let status = next_line(&mut dbg, base, syms.as_ref())?;
+                let status = next_line(dbg, base, syms)?;
                 CHILD_RUNNING.store(false, Ordering::SeqCst);
-                print_status(status);
+                print_status(dbg, status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
-                check_soft_watches(&dbg, &mut soft_watches);
-                show_context(&dbg, base, syms.as_ref());
+                check_soft_watches(dbg, soft_watches);
+                show_context(dbg, base, syms);
             }
             "si" | "stepi" => {
                 CHILD_RUNNING.store(true, Ordering::SeqCst);
                 let status = dbg.step()?;
                 CHILD_RUNNING.store(false, Ordering::SeqCst);
-                print_status(status);
+                print_status(dbg, status);
                 if matches!(status, WaitStatus::Exited { .. }) {
                     break;
                 }
-                check_soft_watches(&dbg, &mut soft_watches);
-                show_context(&dbg, base, syms.as_ref());
+                check_soft_watches(dbg, soft_watches);
+                show_context(dbg, base, syms);
             }
             "up" | "finish" => {
                 CHILD_RUNNING.store(true, Ordering::SeqCst);
@@ -1097,23 +1343,23 @@ fn main() -> io::Result<()> {
                 CHILD_RUNNING.store(false, Ordering::SeqCst);
                 match result {
                     Ok(status) => {
-                        print_status(status);
+                        print_status(dbg, status);
                         if matches!(status, WaitStatus::Exited { .. }) {
                             break;
                         }
-                        show_context(&dbg, base, syms.as_ref());
+                        show_context(dbg, base, syms);
                     }
                     Err(e) => eprintln!("failed to finish: {}", e),
                 }
             }
             "tb" | "bt" | "backtrace" => {
-                print_backtrace(&dbg, base, syms.as_ref());
+                print_backtrace(dbg, base, syms);
             }
             "list" | "l" => {
-                show_list(&parts, &dbg, base, syms.as_ref());
+                show_list(&parts, dbg, base, syms);
             }
             "syms" | "symbols" => {
-                if let Some(syms) = syms.as_ref() {
+                if let Some(syms) = syms {
                     let filter = if parts.len() >= 2 { Some(parts[1]) } else { None };
                     syms.print_symbols(filter);
                 } else {
@@ -1121,7 +1367,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "lines" => {
-                if let Some(syms) = syms.as_ref() {
+                if let Some(syms) = syms {
                     let filter = if parts.len() >= 2 { Some(parts[1]) } else { None };
                     syms.print_lines(filter);
                 } else {
@@ -1131,7 +1377,7 @@ fn main() -> io::Result<()> {
             "dbg" | "info" => {
                 println!("pid: {}", dbg.pid);
                 println!("program: {}", program);
-                if let Some(syms) = syms.as_ref() {
+                if let Some(syms) = syms {
                     syms.print_debug_info(base);
                 } else {
                     eprintln!("no symbol information loaded");
@@ -1168,7 +1414,7 @@ fn main() -> io::Result<()> {
                     eprintln!("usage: p[/FMT] <expr>  (FMT: x X d u o t c a s)");
                     continue;
                 }
-                match eval_expression(&dbg, base, syms.as_ref(), expr_str) {
+                match eval_expression(dbg, base, syms, expr_str) {
                     Ok(v) => {
                         // 常に "expr = " プレフィックスを付ける
                         let prefix = format!("{} = ", expr_str);
@@ -1245,7 +1491,7 @@ fn main() -> io::Result<()> {
                     eprintln!("usage: set <lvalue> = <expr>");
                     continue;
                 }
-                let value = match eval_expression(&dbg, base, syms.as_ref(), value_expr) {
+                let value = match eval_expression(dbg, base, syms, value_expr) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("set: {}", e);
@@ -1312,18 +1558,18 @@ fn main() -> io::Result<()> {
                         if target.starts_with('*') {
                             // *expr: 内側の式を評価してポインタ値を得て、そこへ書き込む
                             let inner = target[1..].trim();
-                            eval_expression(&dbg, base, syms.as_ref(), inner)
+                            eval_expression(dbg, base, syms, inner)
                                 .map(|ptr| (ptr, 8, LvalKind::Ptr(ptr)))
                         } else if target.starts_with('&') {
                             // &var: 変数のアドレス = 変数自体への書き込みと同じ
                             let inner = target[1..].trim();
-                            resolve_variable(&dbg, base, syms.as_ref(), inner)
+                            resolve_variable(dbg, base, syms, inner)
                                 .map(|(a, sz)| (a, sz as usize, LvalKind::Var(inner.to_string())))
                         } else if is_identifier(target) {
-                            resolve_variable(&dbg, base, syms.as_ref(), target)
+                            resolve_variable(dbg, base, syms, target)
                                 .map(|(a, sz)| (a, sz as usize, LvalKind::Var(target.to_string())))
                         } else {
-                            eval_expression(&dbg, base, syms.as_ref(), target)
+                            eval_expression(dbg, base, syms, target)
                                 .map(|v| (v, 8, LvalKind::Ptr(v)))
                         };
 
@@ -1361,7 +1607,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "dis" | "disasm" | "disassemble" => {
-                show_disasm(&parts, &dbg, base, syms.as_ref());
+                show_disasm(&parts, dbg, base, syms);
             }
             "show" => {
                 if parts.get(1) == Some(&"watch") {
@@ -1380,7 +1626,7 @@ fn main() -> io::Result<()> {
                             slot, info.addr, info.len.as_bytes(), cond_str
                         );
                     }
-                    for wp in &soft_watches {
+                    for wp in soft_watches.iter() {
                         any = true;
                         let cur = bytes_to_u64(&wp.prev_value);
                         println!(
@@ -1395,18 +1641,18 @@ fn main() -> io::Result<()> {
                 }
                 if parts.get(1) == Some(&"leaks") {
                     match leak_tracker.as_ref() {
-                        Some(tr) => tr.show_leaks(syms.as_ref(), base),
+                        Some(tr) => tr.show_leaks(syms, base),
                         None => eprintln!("leak tracking not enabled (use 'leaks on' to start)"),
                     }
                 } else {
-                    show_command(&parts, &dbg, base, syms.as_ref());
+                    show_command(&parts, dbg, base, syms);
                 }
             }
             "leaks" => {
                 let sub = parts.get(1).copied().unwrap_or("");
                 match sub {
                     "on" | "start" | "enable" => {
-                        let Some(ref syms) = syms else {
+                        let Some(syms) = syms else {
                             eprintln!("leaks: no symbol info loaded");
                             continue;
                         };
@@ -1423,21 +1669,21 @@ fn main() -> io::Result<()> {
                             continue;
                         }
                         let mut tr = LeakTracker::new();
-                        match tr.enable(&mut dbg, malloc, calloc, realloc, free) {
+                        match tr.enable(dbg, malloc, calloc, realloc, free) {
                             Ok(()) => {
                                 println!("Leak tracking enabled.");
                                 if let Some(a) = malloc  { println!("  malloc  @ {:#018x}", a); }
                                 if let Some(a) = calloc  { println!("  calloc  @ {:#018x}", a); }
                                 if let Some(a) = realloc { println!("  realloc @ {:#018x}", a); }
                                 if let Some(a) = free    { println!("  free    @ {:#018x}", a); }
-                                leak_tracker = Some(tr);
+                                *leak_tracker = Some(tr);
                             }
                             Err(e) => eprintln!("leaks: {}", e),
                         }
                     }
                     "off" | "stop" | "disable" => {
                         if let Some(mut tr) = leak_tracker.take() {
-                            if let Err(e) = tr.disable(&mut dbg) {
+                            if let Err(e) = tr.disable(dbg) {
                                 eprintln!("leaks: {}", e);
                             } else {
                                 println!("Leak tracking disabled.");
@@ -1448,7 +1694,7 @@ fn main() -> io::Result<()> {
                     }
                     "show" | "status" | "" => {
                         match leak_tracker.as_ref() {
-                            Some(tr) => tr.show_leaks(syms.as_ref(), base),
+                            Some(tr) => tr.show_leaks(syms, base),
                             None => eprintln!("leak tracking not enabled (use 'leaks on' to start)"),
                         }
                     }
@@ -1461,8 +1707,38 @@ fn main() -> io::Result<()> {
                     Err(e) => eprintln!("failed to get image base: {}", e),
                 }
             }
+            "threads" => {
+                print_threads(dbg, base, syms);
+            }
+            "thread" => {
+                let sub = parts.get(1).copied().unwrap_or("list");
+                match sub {
+                    "list" | "" => print_threads(dbg, base, syms),
+                    "select" => match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
+                        Some(idx) => match dbg.select_thread(idx) {
+                            Ok(()) => println!("current thread: #{}", idx),
+                            Err(e) => eprintln!("thread select: {}", e),
+                        },
+                        None => eprintln!("usage: thread select <index>"),
+                    },
+                    "suspend" => match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
+                        Some(idx) => match dbg.suspend_thread(idx) {
+                            Ok(()) => println!("thread #{} suspended", idx),
+                            Err(e) => eprintln!("thread suspend: {}", e),
+                        },
+                        None => eprintln!("usage: thread suspend <index>"),
+                    },
+                    "resume" => match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
+                        Some(idx) => match dbg.resume_thread(idx) {
+                            Ok(()) => println!("thread #{} resumed", idx),
+                            Err(e) => eprintln!("thread resume: {}", e),
+                        },
+                        None => eprintln!("usage: thread resume <index>"),
+                    },
+                    _ => eprintln!("usage: thread [list | select <idx> | suspend <idx> | resume <idx>]"),
+                }
+            }
             "q" | "quit" | "exit" => {
-                let _ = dbg.kill();
                 break;
             }
             _ => {
@@ -1471,5 +1747,52 @@ fn main() -> io::Result<()> {
         }
     }
 
+    // 全セッションを後始末する (spawn したものは kill、attach したものは detach)
+    for sess in &sessions {
+        let _ = sess.dbg.shutdown();
+    }
+
     Ok(())
+}
+
+/// スレッド一覧を表示します。シンボル情報があれば各スレッドの PC に対応する
+/// 関数名・ソース行 (と可能ならソースコード本文) もあわせて表示します。
+fn print_threads(dbg: &Debugger, base: Option<u64>, syms: Option<&Symbols>) {
+    for t in dbg.threads() {
+        let marker = if t.current { "*" } else { " " };
+        let pc_str = t.pc.map(|pc| format!("{:#018x}", pc)).unwrap_or_else(|| "?".to_string());
+        let state = if t.suspended { " [suspended]" } else { "" };
+        println!("{} #{} tid={:#x} pc={}{}", marker, t.index, t.tid, pc_str, state);
+
+        let Some(pc) = t.pc else { continue };
+        let Some(syms) = syms else { continue };
+        let Some(base) = base else { continue };
+        // libsystem_kernel 等、自プログラムの外側 (システムライブラリ内で
+        // syscall 待ちなど) にいるスレッドは symbol テーブルに無関係な最寄り
+        // シンボルが誤ってマッチしてしまうため、自プログラムのイメージ範囲内
+        // (base からの妥当なオフセット) のときだけ解決を試みる。
+        if pc < base || pc - base > 0x1000000 {
+            continue;
+        }
+        let static_addr = pc.wrapping_sub(syms.slide(base));
+
+        let func = syms.find_symbol_for_addr(static_addr).map(|(name, off)| {
+            if off == 0 { name.to_string() } else { format!("{}+{:#x}", name, off) }
+        });
+        let loc = syms.find_location(static_addr);
+
+        match (&func, &loc) {
+            (Some(f), Some((file, line))) => println!("        {} at {}:{}", f, file, line),
+            (Some(f), None) => println!("        {}", f),
+            (None, Some((file, line))) => println!("        {}:{}", file, line),
+            (None, None) => {}
+        }
+        if let Some((file, line)) = loc {
+            if let Ok(text) = fs::read_to_string(&file) {
+                if let Some(src) = text.lines().nth((line as usize).wrapping_sub(1)) {
+                    println!("        {:>4} | {}", line, src);
+                }
+            }
+        }
+    }
 }

@@ -10,3 +10,7 @@ libc = "0.2"
 object = "0.36"
 gimli = "0.31"
 capstone = "0.12"
+lalrpop-util = { version = "0.23", features = ["lexer"] }
+
+[build-dependencies]
+lalrpop = "0.23"

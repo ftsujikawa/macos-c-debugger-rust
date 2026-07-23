@@ -1,0 +1,90 @@
+// `p`/`print`/`set` などで使う式の文法定義 (lalrpop = yacc 相当)。
+// 字句解析は lalrpop 標準の内蔵レキサー (lex 相当、下の `match` ブロックで
+// 空白の読み飛ばしとトークンの優先順位のみ指定) を使う。
+// 演算子の優先順位は式評価側 (crate::expr) の元の再帰下降パーサーと同じ
+// 段構成 (Or < Xor < And < Shift < Add < Mul < Unary < Postfix < Primary) で表現し、
+// 単項 `&`(アドレス参照)/`*`(デリファレンス) と二項 `&`/`*` の曖昧さは
+// 段ごとに非終端記号を分けることで (yacc の演算子優先順位宣言を使わずに) 解消している。
+
+use crate::expr::{Expr, Op};
+
+grammar;
+
+match {
+    r"\s*" => { }, // 空白を読み飛ばす
+} else {
+    _
+}
+
+pub Expr: Expr = {
+    OrExpr,
+};
+
+OrExpr: Expr = {
+    <l:OrExpr> "|" <r:XorExpr> => Expr::Binary(Op::Or, Box::new(l), Box::new(r)),
+    XorExpr,
+};
+
+XorExpr: Expr = {
+    <l:XorExpr> "^" <r:AndExpr> => Expr::Binary(Op::Xor, Box::new(l), Box::new(r)),
+    AndExpr,
+};
+
+AndExpr: Expr = {
+    <l:AndExpr> "&" <r:ShiftExpr> => Expr::Binary(Op::And, Box::new(l), Box::new(r)),
+    ShiftExpr,
+};
+
+ShiftExpr: Expr = {
+    <l:ShiftExpr> "<<" <r:AddExpr> => Expr::Binary(Op::Shl, Box::new(l), Box::new(r)),
+    <l:ShiftExpr> ">>" <r:AddExpr> => Expr::Binary(Op::Shr, Box::new(l), Box::new(r)),
+    AddExpr,
+};
+
+AddExpr: Expr = {
+    <l:AddExpr> "+" <r:MulExpr> => Expr::Binary(Op::Add, Box::new(l), Box::new(r)),
+    <l:AddExpr> "-" <r:MulExpr> => Expr::Binary(Op::Sub, Box::new(l), Box::new(r)),
+    MulExpr,
+};
+
+MulExpr: Expr = {
+    <l:MulExpr> "*" <r:UnaryExpr> => Expr::Binary(Op::Mul, Box::new(l), Box::new(r)),
+    <l:MulExpr> "/" <r:UnaryExpr> => Expr::Binary(Op::Div, Box::new(l), Box::new(r)),
+    <l:MulExpr> "%" <r:UnaryExpr> => Expr::Binary(Op::Mod, Box::new(l), Box::new(r)),
+    UnaryExpr,
+};
+
+UnaryExpr: Expr = {
+    "+" <e:UnaryExpr> => e,
+    "-" <e:UnaryExpr> => Expr::Unary(Op::Neg, Box::new(e)),
+    "~" <e:UnaryExpr> => Expr::Unary(Op::Not, Box::new(e)),
+    "*" <e:UnaryExpr> => Expr::Unary(Op::Deref, Box::new(e)),
+    "&" <e:UnaryExpr> => Expr::Unary(Op::AddrOf, Box::new(e)),
+    PostfixExpr,
+};
+
+// プライマリ式の後に続く `.field` / `->field` チェーン。
+PostfixExpr: Expr = {
+    <e:PostfixExpr> "." <f:Ident> => Expr::Member(Box::new(e), f),
+    <e:PostfixExpr> "->" <f:Ident> => Expr::PtrMember(Box::new(e), f),
+    Primary,
+};
+
+Primary: Expr = {
+    Number => Expr::Number(<>),
+    Register => Expr::Register(<>),
+    Ident => Expr::Variable(<>),
+    "(" <e:OrExpr> ")" => e,
+};
+
+Number: u64 = {
+    r"0[xX][0-9a-fA-F]+" => u64::from_str_radix(&<>[2..], 16).unwrap_or(0),
+    r"0[bB][01]+" => u64::from_str_radix(&<>[2..], 2).unwrap_or(0),
+    r"0[oO][0-7]+" => u64::from_str_radix(&<>[2..], 8).unwrap_or(0),
+    r"[0-9]+" => <>.parse().unwrap_or(0),
+};
+
+// `$rax` のようなレジスタ名。先頭の `$` は除いて保持する。
+Register: String = r"\$[A-Za-z_][A-Za-z0-9_]*" => <>[1..].to_string();
+
+Ident: String = r"[A-Za-z_][A-Za-z0-9_]*" => <>.to_string();
